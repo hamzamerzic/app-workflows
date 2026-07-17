@@ -1,0 +1,13 @@
+# Runtime + build artifacts — source and declared assets only in the repo.
+node_modules/
+dist/
+.build/
+__pycache__/
+*.pyc
+# The refresh job's local cursor/lock state (written under the installed tree).
+state/
+# icon.png is the shipped asset; icon-src.png is the raw pre-crop generation.
+icon-src.png
+*.log
+*.bak
+.DS_Store

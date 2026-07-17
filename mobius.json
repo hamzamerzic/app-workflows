@@ -1,0 +1,23 @@
+{
+  "id": "workflows",
+  "name": "Workflows",
+  "version": "0.1.0",
+  "description": "See the background helpers your chats spin up — what they are doing, whether they finished, and what they reported back.",
+  "entry": "index.jsx",
+  "icon": "icon.png",
+  "source_files": [
+    "storage.js",
+    "domain.js",
+    "theme.js",
+    "views/Home.jsx",
+    "views/ChatDetail.jsx",
+    "views/HelperDetail.jsx",
+    "parse_runs.py"
+  ],
+  "schedule": {
+    "default": "*/10 * * * *",
+    "user_configurable": true,
+    "job": "refresh.sh"
+  },
+  "permissions": {}
+}
