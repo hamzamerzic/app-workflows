@@ -758,9 +758,15 @@ def _parse_codex_rollout(rollout: Path, model: dict, cursors: CursorStore,
     if rtype == "session_meta":
       sid = str(payload.get("session_id") or payload.get("id") or sid or rollout.stem)
       session = _session(model, sid, "codex")
+      spawn = _codex_spawn_info(payload)
       session["parent_thread_id"] = (
         payload.get("parent_thread_id") or payload.get("parentThreadId")
-        or session.get("parent_thread_id"))
+        or spawn.get("parent_thread_id") or session.get("parent_thread_id"))
+      # A forked sub-agent's assignment lives in its own session_meta source, not
+      # in a user_message — carry it so the helper card is labelled by the task
+      # it was spawned for rather than left blank.
+      if spawn.get("label") and not session.get("spawn_label"):
+        session["spawn_label"] = spawn["label"]
       cursors.set(f"codex-sid::{rollout}", {"sid": sid})
     ts = rec.get("timestamp")
     if session and ts:
@@ -770,6 +776,31 @@ def _parse_codex_rollout(rollout: Path, model: dict, cursors: CursorStore,
       _fold_codex_helper_activity(rtype, payload, sid, model)
   if session is not None:
     _bump_activity(session, _mtime_iso(rollout))
+
+
+def _codex_spawn_info(meta_payload: dict) -> dict:
+  """Pulls a forked sub-agent's parent + human label out of its session_meta.
+
+  A spawned Codex sub-agent records its origin under
+  ``source.subagent.thread_spawn`` = {parent_thread_id, agent_path,
+  agent_nickname, ...}. The task it was spawned for is the ``agent_path``
+  (e.g. "/root/calculate_product"); ``agent_nickname`` ("Mendel") is a fallback.
+  Tolerant of camel/snake and a missing source (a top-level chat returns {}).
+  """
+  src = meta_payload.get("source") or meta_payload.get("threadSource") or {}
+  if not isinstance(src, dict):
+    return {}
+  sub = src.get("subagent") or src.get("subAgent") or {}
+  spawn = sub.get("thread_spawn") or sub.get("threadSpawn") or {}
+  if not isinstance(spawn, dict):
+    return {}
+  path = spawn.get("agent_path") or spawn.get("agentPath") or ""
+  nick = spawn.get("agent_nickname") or spawn.get("agentNickname") or ""
+  label = str(path).lstrip("/").replace("_", " ").strip() or str(nick).strip()
+  return {
+    "parent_thread_id": spawn.get("parent_thread_id") or spawn.get("parentThreadId"),
+    "label": label,
+  }
 
 
 def _codex_sid_for(rollout: Path, model: dict, cursors: CursorStore) -> Optional[str]:
@@ -862,6 +893,8 @@ def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
   agent = _agent(model, sid, "collab", sid, "collab")
   if not agent["agent_type"]:
     agent["agent_type"] = "codex"
+  if session.get("spawn_label") and not agent["goal"]:
+    agent["goal"] = str(session["spawn_label"])
   if rtype == "response_item" and payload.get("type") == "function_call":
     agent["steps"].append({"kind": "tool", "title": str(payload.get("name") or "tool"),
                            "detail": _short_input(_json_or_none(payload.get("arguments")))})
