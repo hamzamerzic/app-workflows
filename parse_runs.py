@@ -1041,6 +1041,15 @@ def fetch_chats(base_url: str, token: str) -> tuple[bool, dict[str, dict]]:
   return True, out
 
 
+# The tool block a chat records when it spawns a background helper. The name
+# is NOT stable across agent-SDK versions — the same delegation surfaces as
+# "Task" on some pins and "Agent" on others — and a chat only has to disagree
+# with this set once for every helper in it to fall into the unlinked bucket
+# with no error anywhere. Matching the set (rather than one literal) keeps a
+# transcript readable across a version bump in either direction.
+SPAWNING_TOOL_NAMES = ("Task", "Agent")
+
+
 def build_tooluse_map(base_url: str, token: str, chats_meta: dict[str, dict],
                       scanned: dict[str, str], budget: Budget,
                       max_fetches: int = 12) -> dict[str, str]:
@@ -1078,7 +1087,9 @@ def build_tooluse_map(base_url: str, token: str, chats_meta: dict[str, dict],
     scanned[chat_id] = activity
     for msg in payload.get("messages", []):
       for block in (msg.get("blocks") or []) if isinstance(msg, dict) else []:
-        if isinstance(block, dict) and block.get("tool") == "Task" and block.get("tool_use_id"):
+        if not isinstance(block, dict) or not block.get("tool_use_id"):
+          continue
+        if block.get("tool") in SPAWNING_TOOL_NAMES:
           out[str(block["tool_use_id"])] = chat_id
   return out
 
