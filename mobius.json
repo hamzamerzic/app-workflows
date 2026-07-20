@@ -15,7 +15,7 @@
     "parse_runs.py"
   ],
   "schedule": {
-    "default": "*/10 * * * *",
+    "default": "17 4 * * *",
     "user_configurable": true,
     "job": "refresh.sh"
   },
