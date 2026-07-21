@@ -67,6 +67,8 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
   const steps = (rec && Array.isArray(rec.steps)) ? rec.steps : []
   const report = (rec && typeof rec.final_report === 'string') ? rec.final_report.trim() : ''
   const blocks = useMemo(() => parseMarkdownLite(report), [report])
+  const handback = (rec && rec.handback) || {}
+  const handbackActions = Array.isArray(handback.actions) ? handback.actions : []
 
   return (
     <div className="wf-root">
@@ -97,6 +99,20 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
       ) : (
         <div className="wf-scroll">
           <div className="wf-goal">{goal}</div>
+
+          {/* The chat recorded this helper as finished, but the payload it
+              handed back was an error. We show the corrected reading and say
+              plainly that we corrected it, rather than repeating a label the
+              evidence contradicts or silently overwriting it. */}
+          {rec.status_overridden && (
+            <div className="wf-note is-corrected">
+              <span aria-hidden="true">⚠</span>
+              <span>
+                The chat marked this helper finished, but it returned an error.
+                Shown as failed.
+              </span>
+            </div>
+          )}
 
           {rec.source_expired && (
             <div className="wf-note is-expired">
@@ -137,7 +153,56 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
             </>
           )}
 
-          {!report && steps.length === 0 && !rec.source_expired && (
+          {/* What the chat did once this helper reported back. Headed "What
+              happened next" rather than "merged", because the transcript can
+              prove the ORDER of events and not that the helper caused them —
+              the wording has to stop exactly where the evidence does. */}
+          {(handback.note || handbackActions.length > 0) && (
+            <>
+              <div className="wf-section-head">
+                <h2 className="wf-section-label">What happened next</h2>
+              </div>
+              {handback.note && <p className="wf-handback-note">{handback.note}</p>}
+              {handbackActions.length > 0 && (
+                <div className="wf-steps">
+                  {handbackActions.map((action, i) => (
+                    <div className="wf-step" key={i}>
+                      <span className="wf-step-glyph is-tool" aria-hidden="true">▸</span>
+                      <div className="wf-step-body">
+                        <div className="wf-step-title">{action.tool}</div>
+                        {action.target && <div className="wf-step-detail">{action.target}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {handback.actions_truncated && (
+                <div className="wf-note">
+                  <span aria-hidden="true">…</span>
+                  <span>The chat kept working after these — showing the first few.</span>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* "We never had a trail" and "the trail aged out" are different
+              facts and must not render the same. A block-derived helper is
+              read from the chat transcript, which records the spawn and the
+              result but never the helper's internal steps — so an empty
+              Activity section here is the expected shape, not a loss. */}
+          {rec.origin === 'block' && steps.length === 0 && (
+            <div className="wf-note">
+              <span aria-hidden="true">▪</span>
+              <span>
+                Read from the chat transcript, which records what this helper
+                was asked to do and what it returned — not the individual steps
+                it took along the way.
+              </span>
+            </div>
+          )}
+
+          {!report && steps.length === 0 && !rec.source_expired
+            && rec.origin !== 'block' && (
             <div className="wf-note">
               <span>This helper recorded no steps or report.</span>
             </div>

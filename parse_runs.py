@@ -1094,6 +1094,441 @@ def build_tooluse_map(base_url: str, token: str, chats_meta: dict[str, dict],
   return out
 
 
+# ---------------------------------------------------------------------------
+# Helpers derived from the chat's OWN Agent block
+# ---------------------------------------------------------------------------
+# A chat records every helper it spawns as an `Agent` tool block: the input
+# carries the goal and the helper type, the output carries whatever the helper
+# handed back. That is enough to answer "what ran, what did it do, how did it
+# end" without any new instrumentation — and unlike the local-trace route it is
+# attributed PERFECTLY, because the block is already inside a known chat. On
+# this instance the trace route resolved 3 chats while the blocks cover 21.
+
+_ERROR_HEAD = re.compile(
+  r"^\s*(API Error\b|error\b|failed\b|Traceback \(most recent call last\))", re.I)
+
+
+def _agent_field(text: str, name: str) -> Optional[str]:
+  """One spawn argument out of an Agent block's input.
+
+  The input reaches us as a STRING in one of two shapes — a Python-dict repr
+  (`{'description': '...'}`) or comma-separated `key=value` — and either can be
+  clipped mid-value because long tool inputs are truncated. Rather than commit
+  to one grammar, pull each field independently and tolerate a value that runs
+  off the end.
+  """
+  if not isinstance(text, str) or not text:
+    return None
+  for pattern in (
+    rf"['\"]{name}['\"]\s*:\s*'((?:[^'\\]|\\.)*)'",   # quoted, closed
+    rf"['\"]{name}['\"]\s*:\s*'((?:[^'\\]|\\.)*)$",   # quoted, truncated
+    rf"(?:^|,\s*){name}=([\s\S]*?)(?=,\s*[A-Za-z_][A-Za-z0-9_]*=|$)",
+  ):
+    hit = re.search(pattern, text)
+    if hit:
+      value = (hit.group(1) or "")
+      value = (value.replace("\\n", "\n").replace("\\t", "\t")
+               .replace("\\'", "'").replace('\\"', '"').strip())
+      if value:
+        return value
+  return None
+
+
+def _split_agent_output(output) -> tuple[Optional[str], Optional[str], Optional[str]]:
+  """`(body, agent_id, usage)` — the helper's result separated from bookkeeping.
+
+  A returned payload concatenates three different things: the actual result, a
+  line naming the agent so it can be resumed, and a usage block. Split them so
+  the result can be shown alone and the bookkeeping does not leak into a summary
+  the reader is trying to skim.
+  """
+  raw = output if isinstance(output, str) else ""
+  agent_hit = re.search(r"agentId:\s*([A-Za-z0-9_-]+)", raw)
+  usage_hit = re.search(r"<usage>([\s\S]*?)</usage>", raw)
+  body = re.sub(r"<usage>[\s\S]*?</usage>", "", raw)
+  body = re.sub(r"^.*agentId:\s*[A-Za-z0-9_-]+.*$", "", body, flags=re.M).strip()
+  return (body or None,
+          agent_hit.group(1) if agent_hit else None,
+          usage_hit.group(1) if usage_hit else None)
+
+
+def _usage_number(usage: Optional[str], key: str) -> Optional[int]:
+  """A usage counter, or None when it was never recorded.
+
+  None and 0 are different facts — a helper that genuinely used no tools and a
+  helper we have no metrics for must not render the same — so a missing counter
+  is never coerced to zero.
+  """
+  if not usage:
+    return None
+  hit = re.search(rf"{key}\s*:\s*(-?\d+)", usage)
+  return int(hit.group(1)) if hit else None
+
+
+_FINISHED_WORDS = {"done", "finished", "completed", "complete", "success"}
+_WORKING_WORDS = {"running", "in_progress", "in-progress", "working", "started"}
+_STOPPED_WORDS = {"stopped", "cancelled", "canceled", "interrupted", "aborted"}
+
+
+def helper_from_agent_block(block: dict, ordinal: int = 0) -> Optional[dict]:
+  """One helper record derived from an `Agent` tool block, in the agent shape
+  the chat documents already use.
+
+  The recorded status is NOT trustworthy on its own: in production, helpers
+  whose payload is an outright API error are still written down as `done`. When
+  the payload contradicts the status the payload wins, because a helper that
+  returned an error did not do the work whatever the bookkeeping says. The
+  override is flagged so the UI can say the label was corrected rather than
+  repeat a comfortable lie.
+  """
+  if not isinstance(block, dict):
+    return None
+  raw_input = block.get("input")
+  raw_input = raw_input if isinstance(raw_input, str) else ""
+  body, agent_id, usage = _split_agent_output(block.get("output"))
+
+  if body is None:
+    kind = "none"
+  elif _ERROR_HEAD.match(body[:200]):
+    kind = "error"
+  else:
+    kind = "result"
+
+  status_word = str(block.get("status") or "").strip().lower()
+  if kind == "error":
+    state, trusted = "failed", status_word not in _FINISHED_WORDS
+  elif status_word in _FINISHED_WORDS:
+    state, trusted = "finished", True
+  elif status_word in _WORKING_WORDS:
+    state, trusted = "working", True
+  elif status_word in _STOPPED_WORDS:
+    state, trusted = "stopped", True
+  else:
+    state, trusted = "unavailable", True
+
+  description = _agent_field(raw_input, "description")
+  prompt = _agent_field(raw_input, "prompt")
+  goal = description or ((prompt or "").split("\n")[0].strip() or None)
+  duration_ms = _usage_number(usage, "duration_ms")
+
+  return {
+    "agent_id": (agent_id or block.get("tool_use_id")
+                 or _stable_agent_id(goal, raw_input, ordinal)),
+    # description + agent_type come from arbitrary tool INPUT, so they get the
+    # same scrub + cap every other free-text field that leaves this job gets —
+    # a spawn prompt can quote a secret just as a report can. None stays None
+    # ("not recorded"), never a placeholder.
+    "description": clip_line(goal) if goal else None,
+    "agent_type": clip_line(_agent_field(raw_input, "subagent_type"), 48) or None,
+    "status": state,
+    "status_overridden": not trusted,
+    "origin": "block",
+    # Scrubbed + capped like every other free-text field that leaves this job;
+    # a helper's returned payload is arbitrary text and can quote a secret. The
+    # card gets the short cap and the detail page the longer one, so the full
+    # copy is carried under a private key the merge pops before the chat
+    # document is written — the chat doc is fetched to render a list and must
+    # not haul every helper's full report along with it.
+    "reported_outcome": _cap_outcome(body) if body else None,
+    "_full_outcome": _cap_report(scrub(body)) if body else None,
+    # Gates whether the card opens a detail page. True only when the helper
+    # returned something, because that longer report is the ONLY thing the page
+    # adds over the card — a block with no payload would open onto a restatement
+    # of the card, so it stays a flat row instead of a dead tap.
+    "has_activity": bool(body),
+    # Whether the spawn was launched to run in the background rather than awaited
+    # inline. Detected HERE so there is one status authority over the block; the
+    # timeline's branch label is a pure map off this record, not a second read of
+    # the payload.
+    "is_async": bool(body) and _ASYNC_ACK in body,
+    "duration_secs": round(duration_ms / 1000) if duration_ms is not None else None,
+    "steps_count": _usage_number(usage, "tool_uses"),
+    "tokens": _usage_number(usage, "subagent_tokens"),
+  }
+
+
+def _handback(blocks: list, start: int, max_actions: int = 5) -> dict:
+  """What the chat did with a helper's result, read from the blocks that follow
+  the `Agent` block at `start`.
+
+  This is the "how did it get merged back in" half of a helper's story, and the
+  transcript already answers it: the parent's next text block is usually it
+  saying what the result means, and the tool calls after that are it acting on
+  the result. Scanning STOPS at the next spawn, so one helper is never credited
+  with the follow-up work of another.
+
+  Deliberately named for what it can prove — this is what the chat did NEXT,
+  which is evidence of a handback, not proof of causation. The UI must not
+  promise more than that, so nothing here is called "merged".
+  """
+  note: Optional[str] = None
+  actions: list[dict] = []
+  truncated = False
+  for block in blocks[start + 1:]:
+    if not isinstance(block, dict):
+      continue
+    if block.get("type") == "text":
+      if note is None:
+        text = clip_line(scrub(str(block.get("content") or "")).strip(), 240)
+        note = text or None
+      continue
+    if block.get("type") != "tool":
+      continue
+    if block.get("tool") in SPAWNING_TOOL_NAMES:
+      break
+    if len(actions) >= max_actions:
+      truncated = True
+      break
+    actions.append({
+      "tool": str(block.get("tool") or "tool"),
+      "target": clip_line(scrub(str(block.get("input") or "")).strip(), 90) or None,
+    })
+  return {"note": note, "actions": actions, "actions_truncated": truncated}
+
+
+def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int) -> str:
+  """A deterministic id for a helper whose payload never named one, so the same
+  block keeps the same identity across runs instead of churning storage.
+
+  The block's position in the chat is part of the seed because two spawns can
+  be genuinely indistinguishable — production has a pair whose input AND output
+  are both empty, and content alone hashes them together. They are still two
+  helpers, so they must not collapse into one record; position is the only
+  thing left that separates them, and it is stable as long as the transcript is
+  append-only.
+  """
+  seed = f"{ordinal}|{goal or ''}|{raw_input[:200]}"
+  return "blk" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:15]
+
+
+# The payload a spawn returns when it is launched to run in the background rather
+# than awaited inline. Its presence is what tells "still out this turn" apart
+# from "came back with a result", and it is NOT an error.
+_ASYNC_ACK = "Async agent launched successfully"
+
+# Ceilings so a chat doc (fetched whole to render one timeline) can't grow
+# without bound. Real turns run ~20 nodes and chats ~2 turns, so these are safety
+# valves, not everyday limits — and a trim NEVER drops a branch (the spawns are
+# the point); only condensable seg/note nodes are shed, and the turn is flagged.
+MAX_CHAT_TURNS = 40
+MAX_TURN_NODES = 60
+
+
+def _cap_turn_nodes(nodes: list) -> tuple[list, bool]:
+  """Keep every branch node; fill the remaining budget with seg/note nodes in
+  order. Returns (nodes, truncated). A spawn is never dropped, so the branch
+  count the header shows always matches what the rail draws."""
+  if len(nodes) <= MAX_TURN_NODES:
+    return nodes, False
+  branches = [n for n in nodes if n.get("t") == "branch"]
+  budget = max(0, MAX_TURN_NODES - len(branches))
+  kept: list = []
+  for n in nodes:
+    if n.get("t") == "branch":
+      kept.append(n)
+    elif budget > 0:
+      kept.append(n)
+      budget -= 1
+  return kept, True
+
+
+def _branch_state(helper: dict) -> str:
+  """The lifecycle a spawn reached, as the PARENT turn recorded it — a PURE MAP
+  off the one helper record `helper_from_agent_block` already produced, never a
+  second read of the block. That keeps a single status authority.
+
+  Four honest states, so nothing that halted is dressed up as progress:
+    failed   — the payload was an error, or a success status the payload
+               contradicts (payload-beats-status, already resolved in `status`).
+    stopped  — the run halted or its state is unavailable: NOT "still out", NOT
+               "merged". A neutral dead-end, consistent with the roster's
+               `stopped` bucket.
+    launched — a background launch (async ack) or still `working`: out on its own
+               with no result recorded THIS turn.
+    returned — the parent recorded it complete.
+
+  It reads only what this turn saw: a helper whose parent payload is a clean
+  async ack but whose OWN downstream transcript later failed reads as `launched`
+  here. Correcting that needs the subagent-transcript join (separate timing
+  work), deliberately out of scope.
+  """
+  status = helper.get("status")
+  if status == "failed" or helper.get("status_overridden"):
+    return "failed"
+  if status in ("stopped", "unavailable"):
+    return "stopped"
+  if status == "working" or helper.get("is_async"):
+    return "launched"
+  return "returned"
+
+
+def _seg_node(run_blocks: list) -> dict:
+  """Condense a maximal run of consecutive non-spawn tool blocks into one node:
+  a tool tally (by descending count) and up to three short input samples, so a
+  160-block turn reads as a handful of nodes rather than 160 rows."""
+  tally: dict[str, int] = {}
+  peek: list[str] = []
+  for b in run_blocks:
+    tool = str(b.get("tool") or "tool")
+    tally[tool] = tally.get(tool, 0) + 1
+    if len(peek) < 3:
+      sample = clip_line(scrub(str(b.get("input") or "")).strip(), 60)
+      if sample:
+        peek.append(sample)
+  ordered = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+  return {
+    "t": "seg",
+    "steps": len(run_blocks),
+    "tally": [{"tool": t, "n": n} for t, n in ordered],
+    "peek": peek,
+  }
+
+
+def _flush_seg(nodes: list, run: list) -> list:
+  """Emit the buffered tool run as a seg node (if any) and start a fresh buffer.
+  Returned so the caller rebinds without a closure over a mutable list."""
+  if run:
+    nodes.append(_seg_node(run))
+  return []
+
+
+def _walk_chat(messages: list) -> tuple[list[dict], list[dict]]:
+  """One ordered pass over a chat's messages, producing BOTH the helper records
+  and the timeline turns.
+
+  They are built together on purpose: a branch node and its helper record must
+  share one `agent_id` (the tap-through contract), and the helper ordinal is the
+  running helper count exactly as the earlier flat scan produced it — so this
+  refactor does not churn a single id. Only an assistant message that actually
+  spawned a helper becomes a turn; a text block is a note, a run of ordinary tool
+  calls collapses into one seg, and each spawn is a branch.
+  """
+  helpers: list[dict] = []
+  turns: list[dict] = []
+  for msg in messages:
+    if not isinstance(msg, dict):
+      continue
+    blocks = msg.get("blocks") or []
+    if not any(isinstance(b, dict) and b.get("type") == "tool"
+               and b.get("tool") in SPAWNING_TOOL_NAMES for b in blocks):
+      continue
+    nodes: list[dict] = []
+    run: list[dict] = []
+    note_idx: list[int] = []
+    nspawn = 0
+    for index, block in enumerate(blocks):
+      if not isinstance(block, dict):
+        continue
+      btype = block.get("type")
+      if btype == "text":
+        text = clip_line(scrub(str(block.get("content") or "")).strip(), 240)
+        if not text:
+          continue
+        run = _flush_seg(nodes, run)
+        note_idx.append(len(nodes))
+        nodes.append({"t": "note", "role": "post", "text": text})
+      elif btype == "tool":
+        if block.get("tool") in SPAWNING_TOOL_NAMES:
+          run = _flush_seg(nodes, run)
+          record = helper_from_agent_block(block, ordinal=len(helpers))
+          if not record:
+            continue
+          handback = _handback(blocks, index)
+          record["_handback"] = handback
+          if handback["note"] or handback["actions"]:
+            record["has_activity"] = True
+          helpers.append(record)
+          nspawn += 1
+          raw_in = block.get("input") if isinstance(block.get("input"), str) else ""
+          nodes.append({
+            "t": "branch",
+            "state": _branch_state(record),
+            "desc": record.get("description") or "Background helper",
+            # null (not a placeholder) when unrecorded — the view omits the chip
+            # rather than assert a type/model we don't have.
+            "agent": record.get("agent_type"),
+            "model": clip_line(_agent_field(raw_in, "model"), 48) or None,
+            "async": bool(record.get("is_async")),
+            # Whether tapping the branch opens a detail page — the SAME gate the
+            # agent page is written under, so a branch never navigates to an
+            # empty view (no dead-end taps).
+            "tappable": bool(record.get("has_activity")),
+            "agent_id": record.get("agent_id"),
+          })
+        else:
+          run.append(block)
+    run = _flush_seg(nodes, run)
+    # positional note flavour: the first note frames what's about to happen, the
+    # last is the turn's closing word, the rest are mid-turn asides.
+    if note_idx:
+      nodes[note_idx[0]]["role"] = "pre"
+      nodes[note_idx[-1]]["role"] = "final"
+    capped, truncated = _cap_turn_nodes(nodes)
+    turns.append({
+      "ts": msg.get("ts") if isinstance(msg.get("ts"), int) else None,
+      "nspawn": nspawn,
+      "nblocks": len(blocks),
+      "nodes": capped,
+      "truncated": truncated,
+    })
+  # Keep the NEWEST turns when a chat runs long (messages arrive oldest-first, so
+  # slice from the end); a slice from the front would pin the view to ancient
+  # history and hide the latest work.
+  return helpers, turns[-MAX_CHAT_TURNS:]
+
+
+def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
+                      scanned: dict[str, str], budget: Budget,
+                      max_fetches: Optional[int] = None
+                      ) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+  """`(chat_id -> [helper record], chat_id -> [timeline turn])` for chats whose
+  transcript contains Agent blocks. Bounded and progressive on the SAME cursor
+  contract as build_tooluse_map: most-recently-active first, a chat is only
+  marked scanned after a successful fetch, and it is re-scanned when its activity
+  advances. Helpers and turns come from one walk (`_walk_chat`) so a branch and
+  its helper share an id.
+
+  The per-run cap exists so an unattended refresh stays inside its time budget,
+  but it also sets how long a first backfill takes to reach old history: the
+  cap is per run, and the newest chats are not the ones that ran helpers. The
+  cursor makes catching up safe to do in bigger strides, so the limit is
+  overridable via `WORKFLOWS_MAX_CHAT_SCANS` for a one-time sweep.
+  """
+  if max_fetches is None:
+    try:
+      max_fetches = int(os.environ.get("WORKFLOWS_MAX_CHAT_SCANS", "") or 40)
+    except ValueError:
+      max_fetches = 40
+  out: dict[str, list[dict]] = {}
+  turns_out: dict[str, list[dict]] = {}
+  rescanned: set[str] = set()
+  fetched = 0
+  ordered = sorted(chats_meta.items(),
+                   key=lambda kv: kv[1].get("activity_at") or "", reverse=True)
+  for chat_id, meta in ordered:
+    if fetched >= max_fetches or budget.exhausted:
+      break
+    activity = meta.get("activity_at") or ""
+    prev = scanned.get(chat_id)
+    if prev is not None and prev >= activity:
+      continue
+    status, payload = _api_get_json(base_url, f"/api/chats/{chat_id}?limit=400", token)
+    fetched += 1
+    if status != 200 or not isinstance(payload, dict):
+      continue
+    scanned[chat_id] = activity
+    rescanned.add(chat_id)
+    helpers, turns = _walk_chat(payload.get("messages", []))
+    if helpers:
+      out[chat_id] = helpers
+    if turns:
+      turns_out[chat_id] = turns
+  # `rescanned` is every chat freshly walked this slice, empty results included,
+  # so the caller can DROP stale state for a chat whose spawns were later
+  # compacted away — an overlay-only merge could never clear it otherwise.
+  return out, turns_out, rescanned
+
+
 def _api_get_json(base_url: str, path: str, token: str) -> tuple[Optional[int], object]:
   """GETs `path` with the bearer token. Returns `(status, data)`:
 
@@ -1223,7 +1658,76 @@ def _cap_outcome(text: str) -> str:
 
 # --- document assembly ------------------------------------------------------
 
-def build_documents(model: dict, attribution: Attribution, now: float
+def _merge_chat_helpers(chats: dict[str, dict], attribution: Attribution,
+                        chat_helpers: dict[str, list[dict]],
+                        agents_out: dict[tuple[str, str], dict]) -> None:
+  """Folds block-derived helpers into the chat documents and their agent pages.
+
+  These carry no step list — the block records the spawn and the result, not
+  the helper's internal trail — so they land as their own run rather than being
+  merged into a trace-derived one, and each page is marked `origin: "block"`.
+  That flag is what lets the reader tell "no trail was ever recorded for this
+  helper" apart from "the trail existed and has since aged out"; both would
+  otherwise render as the same empty view and quietly misdescribe the data.
+
+  A chat the local traces could not attribute gets its document created here,
+  which is the whole point of this route: the block always knows its own chat.
+  """
+  for chat_id, helpers in chat_helpers.items():
+    if not helpers:
+      continue
+    doc = chats.get(chat_id)
+    if doc is None:
+      doc = _empty_chat_doc(chat_id, attribution, {})
+      chats[chat_id] = doc
+    known = {
+      a.get("agent_id")
+      for run in doc["runs"] for a in run.get("agents", [])
+    }
+    fresh = [h for h in helpers if h.get("agent_id") not in known]
+    if not fresh:
+      continue
+    summaries = []
+    for helper in fresh:
+      if helper.get("has_activity"):
+        agents_out[(chat_id, helper["agent_id"])] = {
+          "schema": SCHEMA_VERSION,
+          "goal": clip_line(helper.get("description") or "", 400),
+          "agent_type": helper.get("agent_type") or "unknown",
+          "steps": [],
+          "final_report": helper.get("_full_outcome") or "",
+          "truncated": False,
+          "source_expired": False,
+          "origin": "block",
+          "status_overridden": bool(helper.get("status_overridden")),
+          # What the chat did once this helper reported back. Lives on the page
+          # rather than the card because the chat document is fetched to render
+          # a list and should not carry every helper's follow-on with it.
+          "handback": helper.get("_handback") or {},
+        }
+      # Copy rather than mutate: `helper` belongs to the cached scan state that
+      # is written back to disk and reused for chats whose activity has not
+      # changed. Popping the private key here would blank every detail page on
+      # the NEXT run, when the reloaded record no longer carries the report.
+      summaries.append({k: v for k, v in helper.items() if not k.startswith("_")})
+    doc["runs"].append({
+      "run_id": "chat-agents",
+      "kind": "tasks",
+      "label": "Helpers spawned in this chat",
+      "started_at": None,
+      "ended_at": None,
+      "agents": summaries,
+      "capabilities": {
+        "has_saved_plan": False,
+        "has_usage": any(h.get("tokens") is not None for h in fresh),
+        "has_live_progress": False,
+      },
+    })
+
+
+def build_documents(model: dict, attribution: Attribution, now: float,
+                    chat_helpers: Optional[dict[str, list[dict]]] = None,
+                    chat_turns: Optional[dict[str, list[dict]]] = None
                     ) -> tuple[dict, dict[str, dict], dict[tuple[str, str], dict]]:
   """Rebuilds the three storage-document families from the accumulator.
 
@@ -1260,6 +1764,25 @@ def build_documents(model: dict, attribution: Attribution, now: float
       run_doc, run_agents = _build_run(run, chat_id, model, now)
       chat_doc["runs"].append(run_doc)
       agents_out.update(run_agents)
+
+  # Fold in helpers read straight from each chat's own Agent blocks before the
+  # roster is computed, so they count toward the same rollups and ordering as
+  # trace-derived ones rather than arriving as a second-class list.
+  if chat_helpers:
+    _merge_chat_helpers(chats, attribution, chat_helpers, agents_out)
+
+  # The timeline is the chat view now, so every chat with recorded turns carries
+  # them on its doc. A chat that has turns always has helpers too (same walk), so
+  # its doc already exists; the fallback create keeps this independent of order.
+  if chat_turns:
+    for chat_id, turns in chat_turns.items():
+      if not turns:
+        continue
+      doc = chats.get(chat_id)
+      if doc is None:
+        doc = _empty_chat_doc(chat_id, attribution, {})
+        chats[chat_id] = doc
+      doc["turns"] = turns
 
   index = _build_index(chats, unlinked, agents_out, now)
   return index, chats, agents_out
@@ -1604,8 +2127,31 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
     tooluse_map.update(build_tooluse_map(
       base_url, service_token, chats_meta, scanned, budget))
 
+  # Helpers the chats record about themselves. This runs every slice (not only
+  # when the trace side wants attribution) because it is the only route that
+  # covers a chat whose helper traces have already aged off disk.
+  helper_scanned = load_json(state_dir / "scanned-chat-helpers.json", {})
+  chat_helpers_state = load_json(state_dir / "chat-helpers.json", {})
+  chat_turns_state = load_json(state_dir / "chat-turns.json", {})
+  new_helpers, new_turns, rescanned = scan_chat_helpers(
+    base_url, service_token, chats_meta, helper_scanned, budget)
+  chat_helpers_state.update(new_helpers)
+  # A rescanned chat replaces its turns wholesale (the transcript is append-only,
+  # so the fresh walk is authoritative); chats not rescanned this slice keep the
+  # turns already on disk.
+  chat_turns_state.update(new_turns)
+  # A chat rescanned to an EMPTY result (its spawns were compacted away) must be
+  # cleared, not left as stale state an overlay-only update can never remove.
+  for cid in rescanned:
+    if cid not in new_helpers:
+      chat_helpers_state.pop(cid, None)
+    if cid not in new_turns:
+      chat_turns_state.pop(cid, None)
+
   attribution = Attribution(links, tooluse_map, chats_meta)
-  index, chats, agents = build_documents(model, attribution, now)
+  index, chats, agents = build_documents(
+    model, attribution, now, chat_helpers=chat_helpers_state,
+    chat_turns=chat_turns_state)
 
   sink: StorageSink = HttpSink(base_url, app_id, app_token)
   written = flush_documents(index, chats, agents, sink, digests)
@@ -1615,6 +2161,9 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   save_json(state_dir / "digests.json", digests)
   save_json(state_dir / "scanned-chats.json", scanned)
   save_json(state_dir / "tooluse-map.json", tooluse_map)
+  save_json(state_dir / "scanned-chat-helpers.json", helper_scanned)
+  save_json(state_dir / "chat-helpers.json", chat_helpers_state)
+  save_json(state_dir / "chat-turns.json", chat_turns_state)
 
   return {
     "chats": len(index["chats"]),

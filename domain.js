@@ -103,22 +103,6 @@ export function hasCodexChat(chats) {
   return (Array.isArray(chats) ? chats : []).some((c) => c && c.provider === 'codex')
 }
 
-// Runs newest-first by start time; entries without a parseable start sink last.
-export function sortRuns(runs) {
-  return [...(Array.isArray(runs) ? runs : [])].sort((a, b) => {
-    const ta = Date.parse((a && a.started_at) || '')
-    const tb = Date.parse((b && b.started_at) || '')
-    return (Number.isFinite(tb) ? tb : -Infinity) - (Number.isFinite(ta) ? ta : -Infinity)
-  })
-}
-
-export function runKindLabel(kind) {
-  if (kind === 'workflow') return 'Plan'
-  if (kind === 'tasks') return 'Helpers'
-  if (kind === 'collab') return 'Collaboration'
-  return 'Run'
-}
-
 // ---------------------------------------------------------------------------
 // Formatting — every one returns null for "omit", never a zero placeholder
 // ---------------------------------------------------------------------------
@@ -137,20 +121,6 @@ export function formatTokens(n) {
   return `${trimNum(n / 1e6, 1)}M`
 }
 
-export function formatDuration(secs) {
-  if (!Number.isFinite(secs) || secs <= 0) return null
-  if (secs < 90) return `${Math.round(secs)}s`
-  const m = Math.round(secs / 60)
-  if (m < 60) return `${m}m`
-  const h = Math.floor(m / 60)
-  const rem = m % 60
-  return rem ? `${h}h ${rem}m` : `${h}h`
-}
-
-export function formatSteps(count) {
-  if (!Number.isFinite(count) || count <= 0) return null
-  return `${count} step${count === 1 ? '' : 's'}`
-}
 
 // ---------------------------------------------------------------------------
 // Relative time

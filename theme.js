@@ -231,63 +231,6 @@ export const CSS = `
 .wf-unlinked-reason { font-size: 14px; color: var(--text); }
 .wf-unlinked-meta { font-size: 12px; color: var(--muted); }
 
-/* Run + phases (ChatDetail) -------------------------------------------------*/
-.wf-run {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-  padding: 14px 15px; display: flex; flex-direction: column; gap: 12px;
-  animation: wf-rise 0.22s ease both;
-}
-.wf-run-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.wf-run-kind {
-  flex: 0 0 auto; display: inline-flex; align-items: center; height: 19px;
-  padding: 0 8px; border-radius: 6px; font-size: 10.5px; font-weight: 800;
-  letter-spacing: 0.05em; text-transform: uppercase;
-  color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
-}
-.wf-run-label {
-  min-width: 0; font-size: 14.5px; font-weight: 650; letter-spacing: -0.01em; flex: 1 1 auto;
-}
-.wf-run-time { font-size: 12px; color: var(--muted); white-space: nowrap; }
-
-.wf-phases {
-  list-style: none; margin: 0; padding: 0 0 0 4px;
-  display: flex; flex-direction: column; gap: 0;
-  border-left: 2px solid color-mix(in srgb, var(--accent) 30%, var(--border));
-}
-.wf-phase { position: relative; padding: 4px 0 10px 16px; }
-.wf-phase:last-child { padding-bottom: 2px; }
-.wf-phase::before {
-  content: ""; position: absolute; left: -5px; top: 8px;
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--surface); border: 2px solid color-mix(in srgb, var(--accent) 55%, var(--border));
-}
-.wf-phase-title { font-size: 13.5px; font-weight: 600; color: var(--text); }
-.wf-phase-detail { margin-top: 2px; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
-
-/* Helper card ---------------------------------------------------------------*/
-.wf-helpers { display: flex; flex-direction: column; gap: 8px; }
-.wf-helper {
-  display: flex; flex-direction: column; gap: 7px; width: 100%; text-align: left;
-  padding: 12px 13px; border-radius: 11px; border: 1px solid var(--border);
-  background: var(--surface2, var(--surface)); color: inherit; font: inherit;
-}
-.wf-helper.is-tappable { cursor: pointer; transition: border-color .14s ease, transform .1s ease, background .14s ease; }
-.wf-helper.is-tappable:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
-.wf-helper.is-tappable:active { transform: scale(0.99); }
-.wf-helper-head { display: flex; align-items: center; gap: 9px; }
-.wf-helper-desc {
-  flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.01em;
-}
-.wf-helper-chevron { flex: 0 0 auto; color: var(--muted); font-size: 18px; line-height: 1; }
-.wf-helper-outcome { font-size: 13px; line-height: 1.5; color: var(--text); }
-.wf-helper-outcome.is-empty { color: var(--muted); font-style: italic; }
-.wf-helper-stats { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-.wf-stat {
-  font-size: 11px; color: var(--muted); font-family: var(--mono, var(--font));
-  padding: 2px 7px; border-radius: 6px;
-  background: color-mix(in srgb, var(--text) 6%, transparent);
-}
-
 /* Helper detail — goal, steps, report --------------------------------------*/
 .wf-goal {
   font-size: 16px; line-height: 1.45; font-weight: 600; letter-spacing: -0.01em;
@@ -330,6 +273,19 @@ export const CSS = `
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
   background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
+/* A status we corrected against the recorded evidence. Warm rather than red:
+   the helper failing is the finding, and the correction itself is a note about
+   provenance, not a second alarm competing with the failed dot beside it. */
+.wf-note.is-corrected {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.wf-handback-note {
+  margin: 0 0 10px; font-size: 13px; line-height: 1.55; color: var(--text);
+  padding-left: 10px; border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
 
 /* mobius-ui:Empty — app-owned; a future-library candidate (no sync owed). */
 .wf-empty {
@@ -368,4 +324,104 @@ export const CSS = `
   font-size: 11px; font-weight: 600; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 /* /mobius-ui:SyncPill */
+
+/* ===== Timeline (the chat view) — a git-graph of turns ===================== */
+.wf-tl-root { display: flex; flex-direction: column; gap: 22px; padding: 14px 14px 40px; }
+
+.wf-tl-legend {
+  display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); font-size: 12.5px; color: var(--muted);
+}
+.wf-tl-lg { display: inline-flex; align-items: center; gap: 6px; }
+.wf-tl-lg b { color: var(--text); }
+.wf-tl-g { width: 15px; height: 15px; flex: 0 0 auto; }
+
+.wf-tl-turn {
+  border: 1px solid var(--border); border-radius: 16px; overflow: hidden;
+  background: var(--surface); animation: wf-rise 0.22s ease both;
+}
+.wf-tl-meta {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 14px 0;
+}
+.wf-tl-pill {
+  font-size: 11px; color: var(--muted); background: var(--surface2, var(--surface));
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px;
+}
+.wf-tl-pill b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+.wf-tl-body { position: relative; padding: 12px 14px 14px; }
+.wf-tl-rail {
+  position: absolute; left: 14px; top: 12px; pointer-events: none; overflow: visible;
+}
+.wf-tl-rows { display: flex; flex-direction: column; }
+
+.wf-tl-row {
+  display: block; width: 100%; text-align: left; appearance: none;
+  background: none; border: 0; color: inherit; font: inherit;
+  padding: 9px 6px 9px 6px; min-height: 40px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.wf-tl-rows > .wf-tl-row:last-child { border-bottom: 0; }
+.wf-tl-row.is-tap { cursor: pointer; }
+.wf-tl-row.is-tap:hover { background: color-mix(in srgb, var(--text) 4%, transparent); }
+.wf-tl-row.is-tap:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 8px; }
+
+.wf-tl-rk {
+  font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  font-weight: 700; color: var(--muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.wf-tl-car { font-size: 10px; color: var(--muted); }
+.wf-tl-sum { font-size: 13.5px; color: var(--text); margin-top: 2px; }
+.wf-tl-sum b { font-weight: 650; }
+.wf-tl-txt { font-size: 13.5px; line-height: 1.5; color: var(--text); margin-top: 3px; }
+.wf-tl-txt.is-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.wf-tl-note.is-final .wf-tl-txt { color: var(--text); }
+
+.wf-tl-desc { font-size: 14px; font-weight: 640; color: var(--text); margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
+.wf-tl-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.wf-tl-chip {
+  font-size: 10.5px; color: var(--muted); background: var(--surface2, var(--surface));
+  border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px;
+}
+.wf-tl-chip.is-agent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.wf-tl-chip.is-mono { font-family: var(--mono, monospace); }
+.wf-tl-state { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12.5px; font-weight: 600; }
+.wf-tl-state.is-merged { color: var(--green); }
+.wf-tl-state.is-detached { color: var(--working, #f5a623); }
+.wf-tl-state.is-failed { color: var(--danger); }
+.wf-tl-state.is-stopped { color: var(--muted); }
+
+.wf-tl-detail { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.wf-tl-peeks { display: flex; flex-direction: column; gap: 4px; }
+.wf-tl-peek {
+  font-family: var(--mono, monospace); font-size: 11.5px; color: var(--muted);
+  background: var(--surface2, var(--surface)); border-radius: 7px; padding: 5px 8px;
+  overflow-wrap: anywhere;
+}
+.wf-tl-tally { display: flex; flex-wrap: wrap; gap: 5px; }
+.wf-tl-tchip { font-size: 11px; color: var(--muted); }
+.wf-tl-tchip b { color: var(--text); }
+
+.wf-tl-trunc { padding: 8px 14px 12px; font-size: 12px; color: var(--muted); }
+.wf-tl-foot { font-size: 12px; color: var(--muted); padding: 0 4px; }
+
+/* SVG rail strokes */
+.wf-tl-trunk { stroke: var(--border); stroke-width: 2.4; fill: none; stroke-linecap: round; }
+.wf-tl-peel { fill: none; stroke-width: 2.4; stroke-linecap: round; }
+.wf-tl-run { fill: none; stroke-width: 2.4; stroke-linecap: round; }
+.wf-tl-peel.mode-returned { stroke: var(--green); }
+.wf-tl-peel.mode-launched, .wf-tl-run.mode-launched { stroke: var(--working, #f5a623); stroke-dasharray: 2 4.5; }
+.wf-tl-peel.mode-failed, .wf-tl-run.mode-failed { stroke: var(--danger); stroke-dasharray: 2 4.5; }
+.wf-tl-peel.mode-stopped, .wf-tl-run.mode-stopped { stroke: var(--muted); stroke-dasharray: 2 4.5; }
+.wf-tl-arrow { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.wf-tl-arrow.mode-launched { stroke: var(--working, #f5a623); }
+.wf-tl-deadend { fill: none; stroke-width: 2.6; stroke-linecap: round; }
+.wf-tl-deadend.mode-failed { stroke: var(--danger); }
+.wf-tl-deadend.mode-stopped { stroke: var(--muted); }
+.wf-tl-fork { fill: var(--border); }
+.wf-tl-merge { fill: var(--green); }
+
+@media (prefers-reduced-motion: reduce) { .wf-tl-turn { animation: none; } }
 `

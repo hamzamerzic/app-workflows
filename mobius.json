@@ -12,6 +12,7 @@
     "views/Home.jsx",
     "views/ChatDetail.jsx",
     "views/HelperDetail.jsx",
+    "views/Timeline.jsx",
     "parse_runs.py"
   ],
   "schedule": {
