@@ -1,82 +1,71 @@
-// Home — the chats that have handed work to background helpers. Working chats
-// sort first, then ones needing attention, then by recency. Each row carries a
-// provider chip, a helper rollup, relative time, tokens tucked small, and a
-// secondary "Open chat" that jumps to the real conversation. Unlinked work and
-// the Codex empty hint sit below the list.
+// Home — the outcome JOURNAL. Reads like a diary of what the assistant got
+// done: an app header, a "Needs you" strip for anything worth a look, then the
+// entries grouped by day. Each entry is one tappable card — an ambient status
+// dot, the plain outcome, an area pill + result + task count — that opens the
+// chat drill-in. No provider vocabulary and no git-graph here; the machine
+// detail lives two levels down. Missing fields are omitted, never faked.
 
 import React from 'react'
-import {
-  providerLabel, providerClass, chatStatus, statusMeta, helperRollup,
-  sortChats, hasCodexChat, formatTokens, relativeTime,
-} from '../domain.js'
+import { statusDot, groupEntriesByDay } from '../domain.js'
 
-function ChatRow({ chat, onOpenDetail, onOpenChat }) {
-  const status = statusMeta(chatStatus(chat.helpers))
-  const tokens = formatTokens(chat.tokens_total)
-  const when = relativeTime(chat.last_activity_at)
-  const title = chat.title || 'Untitled chat'
+// The strip at the top of the journal. Amber and tappable while something is
+// unverified/failed/running; a quiet "all caught up" once nothing needs a look.
+// Tapping opens the first flagged chat (the count says there are more).
+function NeedsStrip({ items, onOpen }) {
+  const list = Array.isArray(items) ? items : []
+  if (list.length === 0) {
+    return (
+      <div className="wf-needs is-clear">
+        <span className="wf-needs-ic" aria-hidden="true">✓</span>
+        <span className="wf-needs-tx"><span className="wf-needs-head">All caught up</span></span>
+      </div>
+    )
+  }
+  const first = list[0]
+  const n = list.length
   return (
-    <li className="wf-row">
-      <button
-        type="button"
-        className="wf-row-main"
-        onClick={() => onOpenDetail(chat)}
-      >
-        <div className="wf-row-top">
-          <span className={`wf-chip ${providerClass(chat.provider)}`}>
-            {providerLabel(chat.provider)}
-          </span>
-          <span className="wf-row-title">{title}</span>
-        </div>
-        <div className="wf-row-meta">
-          <span className={`wf-dot ${status.dot}`} aria-hidden="true" />
-          <span className="wf-row-rollup">{helperRollup(chat.helpers)}</span>
-          {when && <span className="wf-row-sep" aria-hidden="true">·</span>}
-          {when && <span className="wf-row-time">{when}</span>}
-          {tokens && <span className="wf-row-tokens">{tokens} tokens</span>}
-        </div>
-      </button>
-      <button
-        type="button"
-        className="wf-row-open"
-        onClick={() => onOpenChat(chat.chat_id)}
-      >
-        Open chat →
-      </button>
-    </li>
+    <button type="button" className="wf-needs" onClick={() => onOpen(first)}>
+      <span className="wf-needs-ic" aria-hidden="true">!</span>
+      <span className="wf-needs-tx">
+        <span className="wf-needs-head">{n} thing{n === 1 ? '' : 's'} worth a look</span>
+        {first && first.outcome && <span className="wf-needs-sub">{first.outcome}</span>}
+      </span>
+      <span className="wf-needs-go" aria-hidden="true">›</span>
+    </button>
   )
 }
 
-function UnlinkedItem({ item }) {
-  const when = relativeTime(item.last_activity_at)
-  const count = Number.isFinite(item.helpers) && item.helpers > 0
-    ? `${item.helpers} helper${item.helpers === 1 ? '' : 's'}`
-    : null
+function EntryCard({ entry, onOpen }) {
+  const dot = statusDot(entry.status)
+  const tasks = Number.isFinite(entry.tasks) ? entry.tasks : null
+  const reco = entry.recovered === true
+  const title = entry.title || entry.outcome || 'Untitled'
   return (
-    <li className="wf-unlinked">
-      <div className="wf-unlinked-top">
-        <span className={`wf-chip ${providerClass(item.provider)}`}>
-          {providerLabel(item.provider)}
-        </span>
-        <span className="wf-unlinked-reason">{item.reason || 'Not linked to a chat'}</span>
-      </div>
-      <div className="wf-unlinked-meta">
-        {count}
-        {count && when ? ' · ' : ''}
-        {when}
-      </div>
-    </li>
+    <button type="button" className={`wf-entry${reco ? ' is-reco' : ''}`} onClick={() => onOpen(entry)}>
+      <span className="wf-entry-title">
+        <span className={`wf-stat ${dot}`} aria-hidden="true" />
+        <span>{title}</span>
+      </span>
+      <span className="wf-entry-meta">
+        {entry.area && <span className="wf-pill is-area">{entry.area}</span>}
+        {entry.result && <span className="wf-sep" aria-hidden="true" />}
+        {entry.result && <span className="wf-result">{entry.result}</span>}
+        {reco && <span className="wf-pill is-reco">✦ recovered</span>}
+        {tasks != null && (
+          <span className="wf-tasks">{tasks} task{tasks === 1 ? '' : 's'} ›</span>
+        )}
+      </span>
+    </button>
   )
 }
 
 export function Home({
-  appId, idx, loaded, online, refreshing, updatedLabel, onRefresh,
-  onOpenDetail, onOpenChat,
+  appId, idx, loaded, online, refreshing, updatedLabel, onRefresh, onOpenDetail,
 }) {
-  const chats = sortChats(idx && idx.chats)
-  const unlinked = (idx && Array.isArray(idx.unlinked)) ? idx.unlinked : []
-  const isEmpty = loaded && chats.length === 0 && unlinked.length === 0
-  const showCodexHint = chats.length > 0 && !hasCodexChat(chats)
+  const entries = (idx && Array.isArray(idx.entries)) ? idx.entries : []
+  const needs = (idx && Array.isArray(idx.needs_attention)) ? idx.needs_attention : []
+  const groups = groupEntriesByDay(entries)
+  const isEmpty = loaded && entries.length === 0
 
   return (
     <div className="wf-root">
@@ -97,19 +86,18 @@ export function Home({
           <span className="wf-mark" style={{ display: 'none' }} aria-hidden="true">W</span>
           <div className="wf-heading">
             <h1 className="wf-title">Workflows</h1>
-            <span className="wf-subtitle">Background helpers across your chats</span>
+            <span className="wf-subtitle">What your assistant got done</span>
           </div>
         </div>
         <div className="wf-header-actions">
-          <span className="wf-status-text" role="status">
-            {refreshing ? 'Updating…' : updatedLabel}
-          </span>
+          {refreshing && <span className="wf-status-text" role="status">Updating…</span>}
           <button
             type="button"
             className={`wf-icon-btn${refreshing ? ' is-spinning' : ''}`}
             onClick={onRefresh}
             disabled={refreshing}
-            aria-label="Refresh background work"
+            title={updatedLabel}
+            aria-label="Refresh"
           >
             <span className="wf-refresh-glyph" aria-hidden="true">⟳</span>
           </button>
@@ -124,10 +112,11 @@ export function Home({
         <div className="wf-scroll">
           <div className="wf-empty">
             <div className="wf-empty-mark" aria-hidden="true">✶</div>
-            <div className="wf-empty-title">No background work yet</div>
+            <div className="wf-empty-title">Nothing here yet</div>
             <p className="wf-empty-text">
-              When your chats hand work to background helpers, it shows up here —
-              what they are doing, whether they finished, and what they reported back.
+              When your assistant works on something in the background, it lands
+              here as a plain-language journal — what it got done, and anything
+              worth a look.
             </p>
             <div className="wf-empty-actions">
               <button type="button" className="wf-btn wf-btn-primary" onClick={onRefresh} disabled={refreshing}>
@@ -138,36 +127,26 @@ export function Home({
         </div>
       ) : (
         <div className="wf-scroll">
-          <ul className="wf-list">
-            {chats.map((chat) => (
-              <ChatRow
-                key={chat.chat_id}
-                chat={chat}
-                onOpenDetail={onOpenDetail}
-                onOpenChat={onOpenChat}
-              />
-            ))}
-          </ul>
-
-          {showCodexHint && (
-            <div className="wf-muted-row">
-              <span className="wf-chip is-codex">CODEX</span>
-              <span>No background helpers in Codex chats yet</span>
-            </div>
-          )}
-
-          {unlinked.length > 0 && (
-            <>
-              <div className="wf-section-head">
-                <h2 className="wf-section-label">Unlinked work</h2>
-              </div>
-              <ul className="wf-list">
-                {unlinked.map((item, i) => (
-                  <UnlinkedItem key={`${item.provider}:${item.session_id || i}`} item={item} />
+          <NeedsStrip items={needs} onOpen={onOpenDetail} />
+          {groups.map((group) => {
+            const groupReco = group.items.some((e) => e && e.recovered === true)
+            return (
+              <React.Fragment key={group.key}>
+                <div className="wf-daylabel">
+                  {group.label}
+                  {groupReco && <span className="wf-restored"> · ✦ restored</span>}
+                </div>
+                {group.items.map((entry, i) => (
+                  <EntryCard
+                    key={entry.chat_id || `${group.key}:${i}`}
+                    entry={entry}
+                    onOpen={onOpenDetail}
+                  />
                 ))}
-              </ul>
-            </>
-          )}
+              </React.Fragment>
+            )
+          })}
+          <div style={{ height: 20 }} />
         </div>
       )}
 

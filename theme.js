@@ -1,10 +1,10 @@
 // Workflows stylesheet — the single app <style> string, rendered once at the
-// app root. Class prefix is `wf-`. Structural colours are theme tokens so light
-// and dark both work; the app follows the owner's `--accent` rather than
-// committing its own brand hue. The one hardcode is the amber "working" status,
-// a semantic state colour the theme has no token for. Shared chrome blocks are
-// fenced with `mobius-ui:*` markers for a future library harvest; app-specific
-// blocks (rows, helper cards, phases, steps) stay unfenced below.
+// app root. Class prefix is `wf-`. The app follows the owner's theme tokens
+// (--surface / --text / --accent / --border …) rather than committing its own
+// brand hue, so light and dark both work; on top of those it derives a small
+// surface hierarchy (--wf-s2/--wf-s3/--wf-line2) and the three semantic status
+// hues the theme has no token for — done (green), attention (amber), running
+// (blue) — the same ambient-status language as the redesign mockup.
 
 export const CSS = `
 /* mobius-ui:Focus — app-owned; a future-library candidate (no sync owed). Required once per app. */
@@ -28,8 +28,8 @@ export const CSS = `
 
 @keyframes wf-spin { to { transform: rotate(360deg); } }
 @keyframes wf-pulse {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.5); opacity: 0.35; }
+  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-run) 34%, transparent); }
+  50% { box-shadow: 0 0 0 3px transparent; }
 }
 @keyframes wf-rise {
   from { opacity: 0; transform: translateY(6px); }
@@ -43,8 +43,21 @@ export const CSS = `
 
 /* mobius-ui:AppShell — app-owned; a future-library candidate (no sync owed).
    Pinned header + an independently scrolling body. Keep the ".wf-scroll > *"
-   flex-shrink:0 rule — without it a small-min-content child gets crushed. */
+   flex-shrink:0 rule — without it a small-min-content child gets crushed.
+   The derived tokens live here so every descendant resolves them. */
 .wf-root {
+  --wf-s2: color-mix(in srgb, var(--text) 4%, var(--surface));
+  --wf-s3: color-mix(in srgb, var(--text) 8%, var(--surface));
+  --wf-line2: color-mix(in srgb, var(--text) 16%, var(--border));
+  --wf-faint: color-mix(in srgb, var(--muted) 62%, transparent);
+  --wf-accent-soft: color-mix(in srgb, var(--accent) 15%, transparent);
+  --wf-done: var(--green, #3f9a5a);
+  --wf-done-soft: color-mix(in srgb, var(--green, #3f9a5a) 15%, transparent);
+  --wf-attn: var(--working, #d39a1a);
+  --wf-attn-soft: color-mix(in srgb, var(--working, #d39a1a) 17%, transparent);
+  --wf-run: #4f83d6;
+  --wf-run-soft: color-mix(in srgb, #4f83d6 16%, transparent);
+
   position: relative; display: flex; flex-direction: column;
   height: 100%; width: 100%; max-width: 100%; overflow: hidden;
   padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
@@ -52,46 +65,42 @@ export const CSS = `
 }
 .wf-scroll {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
-  padding: 14px 16px calc(36px + env(safe-area-inset-bottom));
-  display: flex; flex-direction: column; gap: 10px;
+  padding: 0 0 calc(30px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column;
   word-break: break-word; overflow-wrap: anywhere;
 }
 .wf-scroll > * { flex-shrink: 0; }
 /* /mobius-ui:AppShell */
 
 /* mobius-ui:Scrollskin — app-owned; a future-library candidate (no sync owed). */
-.wf-scroll::-webkit-scrollbar { width: 9px; height: 9px; }
-.wf-scroll::-webkit-scrollbar-thumb {
-  background: var(--border); border-radius: 999px;
-  border: 2px solid transparent; background-clip: padding-box;
-}
-.wf-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: padding-box; }
-.wf-scroll::-webkit-scrollbar-track { background: transparent; }
+.wf-scroll::-webkit-scrollbar { width: 0; height: 0; }
+.wf-scroll { scrollbar-width: none; }
 /* /mobius-ui:Scrollskin */
 
-/* mobius-ui:Header — app-owned; a future-library candidate (no sync owed). */
+/* mobius-ui:Header — app-owned; a future-library candidate (no sync owed).
+   The flex shell already pins this above the scroll, so no sticky is needed. */
 .wf-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 11px;
   min-height: 52px;
-  padding: max(12px, env(safe-area-inset-top)) 14px 12px;
+  padding: max(11px, env(safe-area-inset-top)) 16px 11px;
   background: var(--surface); border-bottom: 1px solid var(--border);
 }
 .wf-brand { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 1 1 auto; }
 .wf-mark {
   flex: 0 0 auto; width: 30px; height: 30px; border-radius: 9px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 15px; font-weight: 800; letter-spacing: -0.03em;
-  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+  font-size: 15px; font-weight: 800; letter-spacing: -0.03em; color: #3a2704;
+  background: linear-gradient(150deg, #f3d488, #b5811f);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.5), 0 1px 2px rgba(120,80,0,.3);
 }
 .wf-brand-icon { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 9px; object-fit: cover; }
 .wf-heading { min-width: 0; }
 .wf-title {
-  margin: 0; font-size: 18px; font-weight: 750; letter-spacing: -0.02em;
+  margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.wf-title-sm { font-size: 16px; }
 .wf-subtitle {
-  display: block; margin-top: 1px; font-size: 12px; color: var(--muted);
+  display: block; margin-top: 1px; font-size: 11.5px; color: var(--muted); letter-spacing: 0.01em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .wf-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
@@ -101,6 +110,16 @@ export const CSS = `
   font-size: 11.5px; color: var(--muted); white-space: nowrap;
   max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* A text back-link — "‹ Activity" / "‹ Back". */
+.wf-back-text {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px;
+  min-height: 40px; padding: 4px 8px 4px 2px; margin-left: -2px;
+  appearance: none; border: 0; background: none; color: var(--accent);
+  font: inherit; font-size: 15px; cursor: pointer; border-radius: 8px;
+}
+.wf-back-text:hover { color: var(--accent); text-decoration: underline; }
+.wf-spacer { flex: 1 1 auto; }
 
 /* mobius-ui:Button — app-owned; a future-library candidate (no sync owed). */
 .wf-btn {
@@ -113,179 +132,239 @@ export const CSS = `
 .wf-btn:active { transform: scale(0.97); }
 .wf-btn:disabled { opacity: 0.5; cursor: default; }
 .wf-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.wf-btn-ghost { background: transparent; border-color: transparent; color: var(--accent); padding: 9px 10px; }
-.wf-btn-ghost:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 /* /mobius-ui:Button */
 
 .wf-icon-btn {
   flex: 0 0 auto; width: 40px; height: 40px; display: inline-flex;
   align-items: center; justify-content: center; border-radius: 10px;
-  border: 1px solid var(--border); background: var(--surface); color: var(--text);
-  font-size: 19px; line-height: 1; cursor: pointer;
-  transition: background .14s ease, transform .1s ease;
+  border: 0; background: none; color: var(--muted);
+  font-size: 18px; line-height: 1; cursor: pointer;
+  transition: color .14s ease, transform .1s ease;
 }
-.wf-icon-btn:hover { background: var(--surface2, var(--surface)); }
+.wf-icon-btn:hover { color: var(--text); }
 .wf-icon-btn:active { transform: scale(0.94); }
 .wf-icon-btn:disabled { opacity: 0.55; cursor: default; }
 .wf-icon-btn .wf-refresh-glyph { display: inline-block; }
 .wf-icon-btn.is-spinning .wf-refresh-glyph { animation: wf-spin 0.9s linear infinite; }
 
-.wf-back {
-  flex: 0 0 auto; width: 40px; height: 40px; display: inline-flex;
-  align-items: center; justify-content: center; border-radius: 10px;
-  border: 1px solid transparent; background: transparent; color: var(--text);
-  font-size: 26px; line-height: 1; cursor: pointer; margin-left: -4px;
-  transition: background .14s ease, transform .1s ease;
-}
-.wf-back:hover { background: var(--surface2, var(--surface)); }
-.wf-back:active { transform: scale(0.94); }
+/* ===== Journal (Home) ====================================================== */
 
-/* Provider chip -------------------------------------------------------------*/
-.wf-chip {
-  flex: 0 0 auto; display: inline-flex; align-items: center; height: 18px;
-  padding: 0 7px; border-radius: 6px; font-size: 10px; font-weight: 800;
-  letter-spacing: 0.06em; font-family: var(--mono, var(--font));
-  border: 1px solid var(--border); color: var(--muted); background: transparent;
+/* Needs-you strip — amber when there's something to look at, a quiet "all
+   caught up" otherwise. Silent-when-healthy: it never becomes a red badge. */
+.wf-needs {
+  display: flex; align-items: center; gap: 10px; width: auto;
+  margin: 14px 14px 4px; padding: 11px 13px; border-radius: 15px;
+  text-align: left; appearance: none; font: inherit; cursor: pointer;
+  background: var(--wf-attn-soft);
+  border: 1px solid color-mix(in srgb, var(--wf-attn) 34%, transparent);
 }
-.wf-chip.is-claude {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+.wf-needs.is-clear { background: var(--surface); border: 1px solid var(--border); cursor: default; }
+.wf-needs:active:not(.is-clear) { transform: scale(0.99); }
+.wf-needs-ic {
+  flex: 0 0 auto; width: 24px; height: 24px; border-radius: 7px;
+  display: grid; place-items: center; font-size: 13px; font-weight: 700;
+  background: var(--wf-attn); color: #fff;
 }
-.wf-chip.is-codex {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--text) 26%, var(--border));
-  background: color-mix(in srgb, var(--text) 7%, transparent);
+.wf-needs.is-clear .wf-needs-ic { background: var(--wf-done-soft); color: var(--wf-done); }
+.wf-needs-tx { display: flex; flex-direction: column; min-width: 0; }
+.wf-needs-head { font-size: 13px; font-weight: 600; color: var(--text); }
+.wf-needs-sub {
+  font-size: 11.5px; color: var(--muted); font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62vw;
+}
+.wf-needs-go { margin-left: auto; color: var(--wf-attn); font-size: 16px; flex: 0 0 auto; }
+
+.wf-daylabel {
+  font-size: 12px; font-weight: 700; color: var(--wf-faint);
+  letter-spacing: 0.04em; text-transform: uppercase; padding: 20px 20px 8px;
+}
+.wf-daylabel .wf-restored {
+  color: var(--accent); text-transform: none; letter-spacing: 0; font-weight: 700;
 }
 
-/* Status dot ----------------------------------------------------------------*/
-.wf-dot {
-  flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%;
-  background: var(--muted); box-sizing: border-box;
+.wf-entry {
+  display: block; width: auto; text-align: left; appearance: none; font: inherit;
+  margin: 0 14px 9px; padding: 13px 14px; border-radius: 16px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border);
+  transition: transform .08s ease, border-color .15s ease; position: relative; overflow: hidden;
+  animation: wf-rise 0.22s ease both;
 }
-.wf-dot.is-finished { background: var(--green); }
-.wf-dot.is-working { background: #f5a623; animation: wf-pulse 1.6s ease-in-out infinite; }
-.wf-dot.is-failed { background: var(--danger); }
-.wf-dot.is-stopped { background: var(--muted); }
-.wf-dot.is-unavailable { background: transparent; border: 1.5px solid var(--border); }
+.wf-entry:active { transform: scale(0.986); }
+.wf-entry:hover { border-color: var(--wf-line2); }
+.wf-entry.is-reco { border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+.wf-entry-title {
+  display: flex; gap: 7px; align-items: flex-start;
+  font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.34; color: var(--text);
+}
+.wf-stat { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; margin-top: 5px; background: var(--muted); }
+.wf-stat.done { background: var(--wf-done); }
+.wf-stat.attn { background: var(--wf-attn); box-shadow: 0 0 0 3px var(--wf-attn-soft); }
+.wf-stat.run { background: var(--wf-run); animation: wf-pulse 1.8s ease-in-out infinite; }
+.wf-entry-meta {
+  margin-top: 7px; font-size: 12px; color: var(--muted);
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+}
+.wf-result { color: var(--muted); }
+.wf-tasks { margin-left: auto; font-size: 11.5px; color: var(--wf-faint); white-space: nowrap; }
 
-/* mobius-ui:SectionHead — app-owned; a future-library candidate (no sync owed). */
-.wf-section-head { display: flex; align-items: baseline; gap: 8px; margin: 12px 2px 2px; }
-.wf-section-label {
-  margin: 0; font-size: 11.5px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.07em; color: var(--muted);
+/* Pills + separator dot — shared by journal entries and turn meta. */
+.wf-pill {
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  background: var(--wf-s3); color: var(--muted);
 }
-/* /mobius-ui:SectionHead */
+.wf-pill.is-area { background: var(--wf-accent-soft); color: var(--accent); }
+.wf-pill.is-reco { background: var(--wf-accent-soft); color: var(--accent); }
+.wf-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--wf-line2); flex: 0 0 auto; }
 
-/* Chat rows (Home) ----------------------------------------------------------*/
-.wf-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
-.wf-row {
-  position: relative; display: flex; flex-direction: column;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-  overflow: hidden; animation: wf-rise 0.22s ease both;
+/* ===== Chat drill-in ======================================================= */
+
+.wf-chat-hero { padding: 16px 20px 8px; }
+.wf-chat-title { margin: 0; font-size: 18px; letter-spacing: -0.02em; line-height: 1.25; color: var(--text); }
+.wf-chat-meta {
+  margin-top: 6px; font-size: 12px; color: var(--muted);
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
 }
-.wf-row-main {
-  display: flex; flex-direction: column; gap: 8px; text-align: left;
-  padding: 13px 15px 11px; border: 0; background: transparent; color: inherit;
-  font: inherit; cursor: pointer; width: 100%;
-  transition: background .14s ease;
+.wf-chan {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 6px; background: var(--wf-s3); color: var(--muted);
 }
-.wf-row-main:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
-.wf-row-main:active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
-.wf-row-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.wf-row-title {
-  min-width: 0; font-size: 15.5px; font-weight: 650; letter-spacing: -0.01em;
+.wf-hero-spacer { flex: 1 1 auto; }
+.wf-openchat {
+  flex: 0 0 auto; appearance: none; font: inherit; font-weight: 600; font-size: 12.5px;
+  padding: 5px 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--wf-line2); background: var(--surface); color: var(--accent);
+}
+.wf-openchat:active { transform: scale(0.97); }
+
+/* The vertical turn-spine — one node per turn, a CSS trunk down the left. */
+.wf-spine { display: flex; flex-direction: column; padding: 0; }
+.wf-turn { position: relative; margin: 4px 14px 0; padding: 14px 0 6px 30px; }
+.wf-turn::before {
+  content: ""; position: absolute; left: 9px; top: 20px; bottom: -6px;
+  width: 2px; background: var(--wf-line2);
+}
+.wf-turn:last-child::before { display: none; }
+.wf-tnode {
+  position: absolute; left: 2px; top: 15px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--bg); border: 2px solid var(--accent); display: grid; place-items: center; z-index: 2;
+}
+.wf-tnode > i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.wf-tnode.attn { border-color: var(--wf-attn); }
+.wf-tnode.attn > i { background: var(--wf-attn); }
+.wf-tnode.run { border-color: var(--wf-run); }
+.wf-tnode.run > i { background: var(--wf-run); }
+.wf-toutcome { font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.36; color: var(--text); }
+.wf-tmeta {
+  margin-top: 5px; font-size: 11.5px; color: var(--muted);
+  display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
+}
+.wf-tflag {
+  margin-top: 9px; display: flex; gap: 8px; padding: 9px 11px; border-radius: 11px;
+  background: var(--wf-attn-soft); border: 1px solid color-mix(in srgb, var(--wf-attn) 26%, transparent);
+  font-size: 12px; line-height: 1.45; color: var(--text);
+}
+.wf-tflag-ic { color: var(--wf-attn); flex: 0 0 auto; }
+
+/* Subagent card. */
+.wf-sub {
+  display: block; width: 100%; text-align: left; appearance: none; font: inherit;
+  margin-top: 10px; padding: 11px 12px; border-radius: 14px; position: relative;
+  background: var(--surface); border: 1px solid var(--border);
+  transition: transform .08s ease, border-color .15s ease;
+}
+.wf-sub.is-tap { cursor: pointer; }
+.wf-sub.is-tap:active { transform: scale(0.99); }
+.wf-sub.is-tap:hover { border-color: var(--wf-line2); }
+.wf-sub-top { display: flex; align-items: center; gap: 9px; }
+.wf-avatar {
+  flex: 0 0 auto; width: 26px; height: 26px; border-radius: 8px;
+  display: grid; place-items: center; font-size: 14px; background: var(--wf-s3);
+}
+.wf-avatar.explore { background: color-mix(in srgb, #4f83d6 16%, var(--surface)); }
+.wf-avatar.codex { background: color-mix(in srgb, #8a63d6 16%, var(--surface)); }
+.wf-avatar.build { background: color-mix(in srgb, var(--green, #3f9a5a) 16%, var(--surface)); }
+.wf-sub-id { min-width: 0; display: flex; flex-direction: column; }
+.wf-sub-name { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); }
+.wf-sub-kind { font-size: 11px; color: var(--wf-faint); font-weight: 500; }
+.wf-sub-state {
+  margin-left: auto; flex: 0 0 auto; font-size: 11px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px; display: inline-flex; gap: 5px; align-items: center;
+  background: var(--wf-s3); color: var(--muted);
+}
+.wf-sub-state.done { background: var(--wf-done-soft); color: var(--wf-done); }
+.wf-sub-state.run { background: var(--wf-run-soft); color: var(--wf-run); }
+.wf-sub-state.failed { background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); color: var(--danger, #c0392b); }
+.wf-sub-state.stopped { background: var(--wf-s3); color: var(--muted); }
+.wf-sub-ask { margin-top: 8px; font-size: 12.5px; color: var(--text); line-height: 1.4; }
+.wf-sub-ask .k { color: var(--wf-faint); font-weight: 600; }
+.wf-strip { margin-top: 9px; display: flex; gap: 5px; flex-wrap: wrap; }
+.wf-act {
+  font-size: 10.5px; font-weight: 600; font-family: var(--mono, monospace);
+  padding: 2px 7px; border-radius: 6px;
+  background: var(--wf-s2); color: var(--muted); border: 1px solid var(--border);
+}
+.wf-sub-res {
+  margin-top: 9px; font-size: 12.5px; color: var(--muted); line-height: 1.4;
+  padding-left: 10px; border-left: 2px solid var(--wf-line2);
+}
+.wf-sub-open { position: absolute; right: 11px; bottom: 11px; color: var(--wf-faint); font-size: 15px; }
+
+/* Per-turn "Technical detail" disclosure — the raw words + commands, one tap down. */
+.wf-tech { margin-top: 10px; }
+.wf-tech-sum {
+  list-style: none; cursor: pointer; font-size: 12px; font-weight: 600; color: var(--wf-faint);
+  display: flex; align-items: center; gap: 6px; padding: 6px 0; min-height: 36px;
+}
+.wf-tech-sum::-webkit-details-marker { display: none; }
+.wf-cx { display: inline-block; transition: transform .15s ease; }
+.wf-tech[open] .wf-cx { transform: rotate(90deg); }
+.wf-techbox { margin-top: 6px; padding: 11px 12px; border-radius: 11px; background: var(--wf-s3); border: 1px solid var(--border); }
+.wf-techbox-lbl {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--wf-faint); margin-bottom: 5px;
+}
+.wf-orig .wf-md { font-size: 12px; color: var(--muted); line-height: 1.5; }
+.wf-cmds { margin-top: 9px; display: flex; flex-direction: column; gap: 4px; }
+.wf-cmd {
+  font-family: var(--mono, monospace); font-size: 10.5px; color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.wf-row-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.wf-row-rollup { font-size: 13px; color: var(--text); }
-.wf-row-sep { color: var(--border); }
-.wf-row-time { font-size: 12.5px; color: var(--muted); }
-.wf-row-tokens {
-  margin-left: auto; font-size: 11px; color: var(--muted);
-  font-family: var(--mono, var(--font)); white-space: nowrap;
-}
-.wf-row-open {
-  align-self: flex-start; margin: 0 8px 10px; min-height: 34px;
-  padding: 5px 12px; border-radius: 8px; border: 1px solid var(--border);
-  background: transparent; color: var(--accent); font: inherit; font-size: 12.5px;
-  font-weight: 600; cursor: pointer; transition: background .14s ease, transform .1s ease;
-}
-.wf-row-open:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
-.wf-row-open:active { transform: scale(0.97); }
 
-/* A muted informational row (Codex empty hint, unlinked reason) --------------*/
-.wf-muted-row {
-  display: flex; align-items: center; gap: 10px; padding: 13px 15px;
-  background: var(--surface); border: 1px dashed var(--border); border-radius: 14px;
-  color: var(--muted); font-size: 13px;
-}
-.wf-muted-row .wf-chip { opacity: 0.85; }
+/* ===== Subagent detail ==================================================== */
 
-/* Unlinked work item --------------------------------------------------------*/
-.wf-unlinked {
-  display: flex; flex-direction: column; gap: 5px; padding: 12px 15px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-}
-.wf-unlinked-top { display: flex; align-items: center; gap: 8px; }
-.wf-unlinked-reason { font-size: 14px; color: var(--text); }
-.wf-unlinked-meta { font-size: 12px; color: var(--muted); }
+.wf-sd-head { padding: 16px 20px 6px; }
+.wf-sd-head .wf-avatar { width: 36px; height: 36px; font-size: 18px; border-radius: 10px; margin-bottom: 9px; }
+.wf-sd-title { margin: 0; font-size: 17px; letter-spacing: -0.02em; line-height: 1.28; color: var(--text); }
+.wf-sd-k { margin-top: 5px; font-size: 12px; color: var(--muted); }
 
-/* Helper detail — goal, steps, report --------------------------------------*/
-.wf-goal {
-  font-size: 16px; line-height: 1.45; font-weight: 600; letter-spacing: -0.01em;
-  color: var(--text); padding: 2px 2px 4px;
+.wf-sect {
+  margin: 16px 16px 0; padding: 13px 14px; border-radius: 15px;
+  background: var(--surface); border: 1px solid var(--border);
 }
-.wf-steps { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
-.wf-step {
-  display: flex; gap: 11px; padding: 9px 2px; border-bottom: 1px solid var(--border);
+.wf-sect-h {
+  margin: 0 0 8px; font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--wf-faint);
 }
-.wf-step:last-child { border-bottom: 0; }
-.wf-step-glyph {
-  flex: 0 0 auto; width: 18px; text-align: center; font-size: 12px; line-height: 1.5;
-  color: var(--muted);
-}
-.wf-step-glyph.is-tool { color: var(--accent); }
-.wf-step-body { min-width: 0; flex: 1 1 auto; }
-.wf-step-title { font-size: 13.5px; font-weight: 600; color: var(--text); }
-.wf-step-detail {
-  margin-top: 2px; font-size: 12.5px; line-height: 1.5; color: var(--muted);
-  white-space: pre-wrap;
-}
+.wf-sect-p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--text); }
+.wf-sect-p .wf-md { font-size: 13px; line-height: 1.5; color: var(--text); }
+.wf-sect.is-next { background: var(--wf-done-soft); border-color: color-mix(in srgb, var(--wf-done) 24%, transparent); }
+.wf-sect.is-next .wf-sect-h { color: var(--wf-done); }
+.wf-sect.is-tech { background: none; border-style: dashed; }
 
-.wf-report { display: flex; flex-direction: column; gap: 8px; }
-.wf-report-p { font-size: 14px; line-height: 1.6; color: var(--text); margin: 0; }
-.wf-report-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
-.wf-report-li { font-size: 14px; line-height: 1.55; color: var(--text); }
-.wf-code {
-  font-family: var(--mono, monospace); font-size: 0.88em;
-  padding: 1px 5px; border-radius: 5px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
+.wf-sd-steps { display: flex; flex-direction: column; gap: 2px; }
+.wf-stp {
+  display: flex; gap: 10px; align-items: flex-start; padding: 6px 0;
+  font-size: 13px; border-bottom: 1px solid var(--border);
 }
-
-.wf-note {
-  display: flex; gap: 8px; padding: 10px 12px; border-radius: 10px;
-  font-size: 12.5px; line-height: 1.5; color: var(--muted);
-  background: color-mix(in srgb, var(--text) 5%, transparent); border: 1px solid var(--border);
+.wf-stp:last-child { border-bottom: 0; }
+.wf-stp-ic {
+  flex: 0 0 auto; width: 22px; height: 22px; border-radius: 7px;
+  display: grid; place-items: center; font-size: 12px; background: var(--wf-s3);
 }
-.wf-note.is-expired {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
-}
-/* A status we corrected against the recorded evidence. Warm rather than red:
-   the helper failing is the finding, and the correction itself is a note about
-   provenance, not a second alarm competing with the failed dot beside it. */
-.wf-note.is-corrected {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-.wf-handback-note {
-  margin: 0 0 10px; font-size: 13px; line-height: 1.55; color: var(--text);
-  padding-left: 10px; border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-}
+.wf-stp-body { min-width: 0; display: flex; flex-direction: column; }
+.wf-stp-label { color: var(--text); }
+.wf-stp-sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
 
 /* mobius-ui:Empty — app-owned; a future-library candidate (no sync owed). */
 .wf-empty {
@@ -296,7 +375,7 @@ export const CSS = `
 .wf-empty-mark {
   width: 62px; height: 62px; margin-bottom: 6px; border-radius: 18px; display: flex;
   align-items: center; justify-content: center; font-size: 28px;
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  background: var(--wf-accent-soft);
 }
 .wf-empty-title { font-size: 17px; font-weight: 700; color: var(--text); }
 .wf-empty-text { margin: 0; font-size: 14px; line-height: 1.6; }
@@ -325,119 +404,7 @@ export const CSS = `
 }
 /* /mobius-ui:SyncPill */
 
-/* ===== Timeline — a chat as high-level, turn-based git-graph =============== */
-.wf-tl-root { display: flex; flex-direction: column; gap: 16px; padding: 14px 14px 40px; }
-
-.wf-tl-turn {
-  border: 1px solid var(--border); border-radius: 16px; overflow: hidden;
-  background: var(--surface); animation: wf-rise 0.22s ease both;
-}
-.wf-tl-meta {
-  display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 12px 14px 2px;
-  font-size: 11.5px; color: var(--muted);
-}
-.wf-tl-meta > span:not(:last-child)::after { content: "·"; margin-left: 10px; color: var(--border); }
-
-.wf-tl-body { position: relative; padding: 8px 14px 12px; }
-.wf-tl-rail { position: absolute; left: 14px; top: 8px; pointer-events: none; overflow: visible; }
-.wf-tl-rows { display: flex; flex-direction: column; }
-
-/* The turn's gist — the agent's own closing words, rendered as markdown. */
-.wf-tl-gist { padding: 8px 4px 8px 6px; }
-.wf-tl-gist .wf-md { font-size: 13.5px; line-height: 1.5; color: var(--text); }
-
-/* A helper in the cluster (git tee). */
-.wf-tl-hrow { padding: 8px 4px 8px 6px; border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent); }
-.wf-tl-hmain {
-  display: block; width: 100%; text-align: left; appearance: none;
-  background: none; border: 0; color: inherit; font: inherit; padding: 2px 0; min-height: 40px;
-}
-.wf-tl-hmain.is-tap { cursor: pointer; }
-.wf-tl-hmain.is-tap:hover .wf-tl-hdesc { color: var(--accent); }
-.wf-tl-hmain.is-tap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
-.wf-tl-hdesc { font-size: 14px; font-weight: 640; color: var(--text); line-height: 1.35; overflow-wrap: anywhere; display: flex; align-items: baseline; gap: 5px; }
-.wf-tl-car { font-size: 10px; color: var(--muted); flex: 0 0 auto; }
-
-.wf-tl-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-.wf-tl-chip {
-  font-size: 10.5px; color: var(--muted); background: var(--surface2, var(--surface));
-  border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; overflow-wrap: anywhere;
-}
-.wf-tl-chip.is-agent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
-.wf-tl-chip.is-mono { font-family: var(--mono, monospace); }
-.wf-tl-state { display: flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 12.5px; font-weight: 600; }
-.wf-tl-state.is-merged { color: var(--green); }
-.wf-tl-state.is-detached { color: var(--working, #f5a623); }
-.wf-tl-state.is-failed { color: var(--danger); }
-.wf-tl-state.is-stopped { color: var(--muted); }
-.wf-tl-g { width: 15px; height: 15px; flex: 0 0 auto; }
-
-/* Instructions disclosure — a sibling control, never nested in the helper button. */
-.wf-tl-disc {
-  display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; min-height: 40px;
-  appearance: none; background: none; border: 0; color: var(--muted); font: inherit;
-  font-size: 12px; font-weight: 600; cursor: pointer; padding: 4px 0;
-}
-.wf-tl-disc:hover { color: var(--text); }
-.wf-tl-disc:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
-.wf-tl-instr {
-  margin-top: 4px; padding: 10px 12px; border-radius: 10px;
-  background: var(--surface2, var(--surface)); border: 1px solid var(--border);
-}
-.wf-tl-instr .wf-md { font-size: 12.5px; line-height: 1.5; color: var(--text); }
-.wf-tl-instr-note { margin-top: 8px; font-size: 11px; color: var(--muted); font-style: italic; }
-
-/* Show/hide activity + the collapsed trail. */
-.wf-tl-activity-toggle {
-  display: flex; align-items: center; gap: 6px; width: 100%; min-height: 40px;
-  appearance: none; background: none; border: 0; border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-  color: var(--muted); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
-  padding: 8px 4px 6px 6px; text-align: left;
-}
-.wf-tl-activity-toggle:hover { color: var(--text); }
-.wf-tl-activity-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-
-.wf-tl-activity {
-  border-top: 1px solid var(--border); background: color-mix(in srgb, var(--text) 2.5%, transparent);
-  padding: 8px 14px 12px; display: flex; flex-direction: column; gap: 8px;
-}
-.wf-tl-act-note .wf-md { font-size: 12.5px; line-height: 1.5; color: var(--muted); }
-.wf-tl-act-note.is-final .wf-md { color: var(--text); }
-.wf-tl-act-seg {
-  display: block; width: 100%; text-align: left; appearance: none; background: none;
-  border: 0; color: inherit; font: inherit; cursor: pointer; padding: 6px 4px; min-height: 40px;
-}
-.wf-tl-act-seg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
-.wf-tl-act-k { font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; color: var(--muted); display: flex; align-items: center; gap: 6px; }
-.wf-tl-act-sum { font-size: 13px; color: var(--text); margin-top: 2px; }
-
-.wf-tl-detail { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
-.wf-tl-peeks { display: flex; flex-direction: column; gap: 4px; }
-.wf-tl-peek {
-  font-family: var(--mono, monospace); font-size: 11.5px; color: var(--muted);
-  background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px;
-  overflow-wrap: anywhere;
-}
-.wf-tl-tally { display: flex; flex-wrap: wrap; gap: 5px; }
-.wf-tl-tchip { font-size: 11px; color: var(--muted); }
-.wf-tl-tchip b { color: var(--text); }
-.wf-tl-trunc { font-size: 11.5px; color: var(--muted); font-style: italic; }
-
-/* SVG rail: trunk + per-helper tee + fate cue. */
-.wf-tl-trunk { stroke: var(--border); stroke-width: 2.2; fill: none; stroke-linecap: round; }
-.wf-tl-tee { fill: none; stroke-width: 2.2; stroke-linecap: round; }
-.wf-tl-tee.mode-returned { stroke: var(--green); }
-.wf-tl-tee.mode-launched { stroke: var(--working, #f5a623); }
-.wf-tl-tee.mode-failed { stroke: var(--danger); }
-.wf-tl-tee.mode-stopped { stroke: var(--muted); }
-.wf-tl-tail { fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 2 4; }
-.wf-tl-tail.mode-launched { stroke: var(--working, #f5a623); }
-.wf-tl-arrow { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.wf-tl-arrow.mode-launched { stroke: var(--working, #f5a623); }
-.wf-tl-fork { fill: var(--border); }
-.wf-tl-merge { fill: var(--green); }
-
-/* Markdown-lite rendering (shared by timeline + helper detail). */
+/* Markdown-lite rendering (shared by the technical detail + helper detail). */
 .wf-md { display: flex; flex-direction: column; gap: 6px; }
 .wf-md-p { margin: 0; overflow-wrap: anywhere; }
 .wf-md-h { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
@@ -446,7 +413,11 @@ export const CSS = `
 .wf-md-h3 { font-size: 1em; letter-spacing: 0.01em; }
 .wf-md-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 3px; }
 .wf-md-li { overflow-wrap: anywhere; }
-.wf-md-code { font-family: var(--mono, monospace); font-size: 0.9em; background: color-mix(in srgb, var(--text) 8%, transparent); border-radius: 4px; padding: 0 4px; overflow-wrap: anywhere; }
+.wf-md-code {
+  font-family: var(--mono, monospace); font-size: 0.9em;
+  background: color-mix(in srgb, var(--text) 8%, transparent); border-radius: 4px; padding: 0 4px;
+  overflow-wrap: anywhere; border: 1px solid var(--border);
+}
 .wf-md-pre {
   margin: 0; padding: 8px 10px; border-radius: 8px; overflow-x: auto;
   background: color-mix(in srgb, var(--text) 7%, transparent);
@@ -454,5 +425,5 @@ export const CSS = `
 }
 .wf-md-pre code { white-space: pre; }
 
-@media (prefers-reduced-motion: reduce) { .wf-tl-turn { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .wf-entry, .wf-sub { animation: none; } }
 `

@@ -80,7 +80,7 @@ export default function App({ appId, token }) {
   useEffect(() => {
     if (idx === undefined || readyRef.current) return
     readyRef.current = true
-    const count = (idx && Array.isArray(idx.chats)) ? idx.chats.length : 0
+    const count = (idx && Array.isArray(idx.entries)) ? idx.entries.length : 0
     if (window.mobius && typeof window.mobius.signal === 'function') {
       window.mobius.signal('app_ready', { chat_count: count })
     }

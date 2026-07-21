@@ -1,19 +1,19 @@
-// Pure display helpers for Workflows: derived status, rollups, ordering, and
-// owner-facing formatting. No React, no I/O — this is the testable core.
+// Pure display helpers for Workflows: day-grouping, owner-facing status/avatar
+// mapping, and formatting. No React, no I/O — this is the testable core.
 //
 // Product-truth rules baked in here: status is DERIVED from the stored
-// artifacts (never model-generated); a missing number is OMITTED, never shown
-// as a zero; a null reported_outcome renders as "No completion report" and is
-// never back-filled with an invented gap.
+// artifacts (never model-generated); a missing value is OMITTED by the view,
+// never shown as a zero or a fake placeholder. The journal reads as a diary of
+// outcomes, so the labels here are plain owner language, not machine vocabulary.
 
 // ---------------------------------------------------------------------------
 // Provider chip
 // ---------------------------------------------------------------------------
 
 export function providerLabel(provider) {
-  if (provider === 'claude') return 'CLAUDE'
-  if (provider === 'codex') return 'CODEX'
-  return (typeof provider === 'string' && provider ? provider.toUpperCase() : 'AGENT')
+  if (provider === 'claude') return 'Claude'
+  if (provider === 'codex') return 'Codex'
+  return (typeof provider === 'string' && provider ? provider : 'Agent')
 }
 
 export function providerClass(provider) {
@@ -23,107 +23,101 @@ export function providerClass(provider) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper status — the five derived states and their dot styling
+// Ambient status — the three journal/turn states and their dot styling.
+// `done` is the quiet default; `attention` is the amber "needs a look"; `run`
+// is in-progress. Anything unknown reads as done rather than inventing an alarm.
 // ---------------------------------------------------------------------------
 
-const STATUS = {
-  finished: { label: 'Finished', dot: 'is-finished' },
-  working: { label: 'Working', dot: 'is-working' },
-  failed: { label: 'Failed', dot: 'is-failed' },
-  stopped: { label: 'Stopped', dot: 'is-stopped' },
-  unavailable: { label: 'Unavailable', dot: 'is-unavailable' },
+export function statusDot(status) {
+  if (status === 'attention') return 'attn'
+  if (status === 'running') return 'run'
+  return 'done'
 }
 
-export function statusMeta(status) {
-  return STATUS[status] || STATUS.unavailable
+// ---------------------------------------------------------------------------
+// Subagent identity — kind → avatar glyph, wrapper class, default name and the
+// plain one-line role. The stored `name` on a sub wins when present; this only
+// fills the glyph/class and a fallback name.
+// ---------------------------------------------------------------------------
+
+const AVATARS = {
+  explore: { cls: 'explore', emoji: '🔍', name: 'Explorer', role: 'read-only helper' },
+  codex: { cls: 'codex', emoji: '◆', name: 'Codex', role: 'second-opinion helper' },
+  build: { cls: 'build', emoji: '🛠', name: 'Builder', role: 'general helper' },
+  general: { cls: 'build', emoji: '🛠', name: 'Helper', role: 'general helper' },
 }
 
-// The single representative state for a whole chat, from its helper tallies.
-// Attention-ordered: an active helper wins, then a failure, then a stop, then
-// a clean finish; nothing known reads as unavailable.
-export function chatStatus(helpers) {
-  const h = helpers || {}
-  if ((h.working || 0) > 0) return 'working'
-  if ((h.failed || 0) > 0) return 'failed'
-  if ((h.finished || 0) > 0) return 'finished'
-  if ((h.stopped || 0) > 0) return 'stopped'
-  return 'unavailable'
+export function avatarFor(kind) {
+  return AVATARS[kind] || AVATARS.general
 }
 
-// A one-line rollup like "5 helpers · all finished" or "3 helpers · 1 working".
-export function helperRollup(helpers) {
-  const h = helpers || {}
-  const finished = h.finished || 0
-  const working = h.working || 0
-  const failed = h.failed || 0
-  const stopped = h.stopped || 0
-  const total = finished + working + failed + stopped
-  if (total === 0) return 'No helpers yet'
-  const noun = total === 1 ? 'helper' : 'helpers'
-  const parts = []
-  if (working) parts.push(`${working} working`)
-  if (failed) parts.push(`${failed} failed`)
-  if (stopped) parts.push(`${stopped} stopped`)
-  let summary
-  if (parts.length === 0) {
-    summary = 'all finished'
-  } else {
-    if (finished) parts.push(`${finished} finished`)
-    summary = parts.join(', ')
+// A subagent's fate, shown as a small badge on its card. Only `done` and `run`
+// appear in the common path; `failed`/`stopped` are styled too so a drifted
+// state never renders unlabelled.
+export function subStateMeta(state) {
+  if (state === 'running') return { cls: 'run', glyph: '◌', label: 'running' }
+  if (state === 'failed') return { cls: 'failed', glyph: '✕', label: 'failed' }
+  if (state === 'stopped') return { cls: 'stopped', glyph: '‖', label: 'stopped' }
+  return { cls: 'done', glyph: '✓', label: 'done' }
+}
+
+// Icon for a `did[]` verb on the subagent detail step list.
+const VERB_ICON = { read: '📖', edited: '✏️', ran: '⌘', wrote: '📝', searched: '🔎' }
+export function verbIcon(verb) {
+  return VERB_ICON[verb] || '•'
+}
+
+// ---------------------------------------------------------------------------
+// Day-grouping — the journal is grouped by calendar day using each entry's ts.
+// Labels: Today / Yesterday / weekday+date within the week / a plain date for
+// older / "Earlier" for anything with a null or unparseable ts. Entries arrive
+// newest-first; a Map keeps first-seen order so a day's entries stay together
+// even if the roster ever interleaves them.
+// ---------------------------------------------------------------------------
+
+function startOfDay(ms) {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+function dayBucket(iso, now) {
+  const t = iso ? Date.parse(iso) : NaN
+  if (!Number.isFinite(t)) return { key: 'earlier', label: 'Earlier' }
+  const today = startOfDay(now)
+  const day = startOfDay(t)
+  const diffDays = Math.round((today - day) / 86400000)
+  const key = `d${day}`
+  if (diffDays <= 0) return { key, label: 'Today' }
+  if (diffDays === 1) return { key, label: 'Yesterday' }
+  const d = new Date(t)
+  if (diffDays < 7) {
+    const weekday = d.toLocaleDateString(undefined, { weekday: 'long' })
+    const md = d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+    return { key, label: `${weekday} · ${md}` }
   }
-  return `${total} ${noun} · ${summary}`
+  const sameYear = d.getFullYear() === new Date(now).getFullYear()
+  const label = d.toLocaleDateString(undefined,
+    sameYear ? { day: 'numeric', month: 'short' }
+             : { day: 'numeric', month: 'short', year: 'numeric' })
+  return { key, label }
 }
 
-// ---------------------------------------------------------------------------
-// Ordering — working-first, then attention (failed), then recency
-// ---------------------------------------------------------------------------
-
-function activityMs(chat) {
-  const t = Date.parse((chat && chat.last_activity_at) || '')
-  return Number.isFinite(t) ? t : 0
-}
-
-export function chatGroup(chat) {
-  const h = (chat && chat.helpers) || {}
-  if ((h.working || 0) > 0) return 0
-  if ((h.failed || 0) > 0) return 1
-  return 2
-}
-
-export function sortChats(chats) {
-  return [...(Array.isArray(chats) ? chats : [])].sort((a, b) => {
-    const ga = chatGroup(a)
-    const gb = chatGroup(b)
-    if (ga !== gb) return ga - gb
-    return activityMs(b) - activityMs(a)
-  })
-}
-
-export function hasCodexChat(chats) {
-  return (Array.isArray(chats) ? chats : []).some((c) => c && c.provider === 'codex')
-}
-
-// ---------------------------------------------------------------------------
-// Formatting — every one returns null for "omit", never a zero placeholder
-// ---------------------------------------------------------------------------
-
-function trimNum(value, digits) {
-  return Number(value.toFixed(digits)).toString()
-}
-
-export function formatTokens(n) {
-  if (!Number.isFinite(n) || n <= 0) return null
-  if (n < 1000) return String(Math.round(n))
-  if (n < 1e6) {
-    const v = n / 1000
-    return `${trimNum(v, v < 100 ? 1 : 0)}k`
+export function groupEntriesByDay(entries, now = Date.now()) {
+  const list = Array.isArray(entries) ? entries : []
+  const groups = []
+  const byKey = new Map()
+  for (const e of list) {
+    const { key, label } = dayBucket(e && e.ts, now)
+    let g = byKey.get(key)
+    if (!g) { g = { key, label, items: [] }; byKey.set(key, g); groups.push(g) }
+    g.items.push(e)
   }
-  return `${trimNum(n / 1e6, 1)}M`
+  return groups
 }
 
-
 // ---------------------------------------------------------------------------
-// Relative time
+// Relative time (used for the header "Updated …" label)
 // ---------------------------------------------------------------------------
 
 export function relativeTime(iso, now = Date.now()) {
@@ -158,9 +152,10 @@ export function isStale(iso, now = Date.now(), thresholdMs = 2 * 60 * 1000) {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown-lite — a safe, tiny subset for helper final reports. Returns a plain
-// block/span structure the view maps to React elements; it never produces HTML,
-// so there is no injection surface.
+// Markdown-lite — a safe, tiny subset for the agent's verbatim words (turn
+// `original`, helper briefs/reports). Returns a plain block/span structure the
+// view maps to React elements; it never produces HTML, so there is no injection
+// surface.
 // ---------------------------------------------------------------------------
 
 function parseInline(text) {

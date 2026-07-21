@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Digest local agent-run traces into the Workflows app's storage documents.
 
-This is the read side of the Workflows "subagent observatory": it walks the
+This is the read side of the Workflows outcome journal: it walks the
 Claude CLI and Codex SDK on-disk session traces under `/data`, reconstructs
 which owner chat spawned which helper (workflow phases, Task subagents, Codex
 collab agents), and writes three families of storage documents the mini-app
 renders — an `index.json` roster, one `chats/<chat_id>.json` per chat, and one
-`agents/<chat_id>/<agent_id>.json` detail page per helper. The document shapes
+`helpers/<agent_id>.json` detail page per helper. The document shapes
 are the frozen schema the UI and this job both code to (see `SCHEMA_NOTES`).
 
 Design commitments that shaped every function here:
 
-- **Status is derived from artifacts, never model-generated.** A helper's
-  status comes from whether its journal recorded a result, whether its
-  transcript is still fresh, or whether a board marked it failed — see
-  `derive_status`. `reported_outcome` is the helper's OWN words (journal result
-  or final report), scrubbed and capped; it is never invented, and a missing
-  one stays `None` (the UI renders "No completion report").
+- **Status is derived from artifacts, never model-generated.** Records sharing
+  an `agent_id` are reconciled once; terminal downstream evidence supersedes an
+  async launch acknowledgement. `report_full` keeps the helper's OWN words,
+  scrubbed and capped, while the plain-language result is deterministic.
 - **Attribution is looked up, never guessed.** A session is joined to a chat
   only through the explicit signals in `Attribution` (session-links API, then a
   Task `tool_use_id` match, then a workflow/collab parent link). We never join
@@ -53,7 +51,7 @@ from typing import Callable, Iterable, Iterator, Optional, Protocol
 
 # --- schema + budget + caps -------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # A single invocation is a slice of a possibly-huge backfill. These two caps
 # are the contract with cron/run-now: never hold the flock or burn resources
@@ -75,9 +73,8 @@ MAX_RECORD_BYTES = 4 * 1024 * 1024
 # is treated as a live helper, older is treated as terminal (stopped/finished).
 FRESH_SECS = 15 * 60
 
-# Structural caps applied at emit time so one runaway helper can't produce an
-# unbounded document. steps keep head+tail with an elision marker between.
-MAX_STEPS = 60
+# Structural caps applied at emit time so one runaway helper cannot produce an
+# unbounded document.
 FINAL_REPORT_CAP = 8 * 1024
 OUTCOME_CAP = 280
 DETAIL_LINE_CAP = 160
@@ -88,19 +85,15 @@ DETAIL_LINE_CAP = 160
 ACCUM_STEP_CAP = 240
 
 # Total self-imposed ceiling for app-side artifacts. Well under the platform's
-# per-app 1 GiB storage quota; when exceeded we evict the oldest agent detail
+# per-app 1 GiB storage quota; when exceeded we evict the oldest helper detail
 # pages (never the roster or chat summaries) — see enforce_app_cap.
 APP_ARTIFACT_CAP_BYTES = 100 * 1024 * 1024
 
 SCHEMA_NOTES = """\
-index.json  {schema, updated_at, chats:[{chat_id,title,provider,runs,
-            helpers:{finished,working,failed,stopped}, last_activity_at,
-            tokens_total}], unlinked:[{provider,session_id,reason,
-            last_activity_at,helpers}]}
-chats/<id> {schema, chat_id, title, provider, runs:[{run_id, kind, label,
-            started_at, ended_at, phases?, agents:[...], capabilities}]}
-agents/<c>/<a> {schema, goal, agent_type, steps:[{kind,title,detail}],
-            final_report, truncated, source_expired}
+index.json  {schema, updated_at, needs_attention:[...], entries:[...]}
+chats/<id> {schema, chat_id, provider, title, outcome, ts, turns:[...]}
+helpers/<id> {schema, agent_id, chat_id, kind, name, ask, brief_full,
+              did:[{verb,label,count}], result, report_full, next, commands}
 """
 
 
@@ -142,8 +135,8 @@ def scrub(text: Optional[str]) -> str:
 
   Best-effort reduced exposure, not a guarantee — a regex cannot catch a pasted
   document or an encoded value; the caps bound how much survives regardless.
-  Applied to every free-text fragment that leaves this job (reported_outcome,
-  step titles/details, final_report).
+  Applied to every free-text fragment that leaves this job (outcomes, briefs,
+  commands, and verbatim reports).
   """
   if not text:
     return ""
@@ -156,22 +149,6 @@ def clip_line(text: str, cap: int = DETAIL_LINE_CAP) -> str:
   """Scrubs then truncates a single detail/title line to `cap` chars."""
   out = scrub(text).replace("\n", " ").strip()
   return out[:cap] + "…" if len(out) > cap else out
-
-
-def cap_steps(steps: list[dict]) -> tuple[list[dict], bool]:
-  """Returns a `MAX_STEPS` head+tail slice plus a `truncated` flag.
-
-  When a helper ran more steps than fit, keep the first and last halves and
-  splice a single `{kind:"note", title:"… N more steps …"}` marker between, so
-  the reader sees the shape of a long run without the whole thing.
-  """
-  if len(steps) <= MAX_STEPS:
-    return steps, False
-  head = MAX_STEPS // 2
-  tail = MAX_STEPS - head - 1
-  omitted = len(steps) - head - tail
-  marker = {"kind": "note", "title": f"… {omitted} more steps …", "detail": ""}
-  return steps[:head] + [marker] + steps[-tail:], True
 
 
 # --- incremental cursor + accumulator store ---------------------------------
@@ -759,9 +736,13 @@ def _parse_codex_rollout(rollout: Path, model: dict, cursors: CursorStore,
       sid = str(payload.get("session_id") or payload.get("id") or sid or rollout.stem)
       session = _session(model, sid, "codex")
       spawn = _codex_spawn_info(payload)
-      session["parent_thread_id"] = (
-        payload.get("parent_thread_id") or payload.get("parentThreadId")
-        or spawn.get("parent_thread_id") or session.get("parent_thread_id"))
+      # session_meta is the fresh authority, including an explicit absence of a
+      # parent. Do not preserve a stale accumulated parent when the current
+      # metadata says this is top-level. Invariant: a session is never its own
+      # parent.
+      parent = (payload.get("parent_thread_id") or payload.get("parentThreadId")
+                or spawn.get("parent_thread_id"))
+      session["parent_thread_id"] = None if not parent or str(parent) == sid else str(parent)
       # A forked sub-agent's assignment lives in its own session_meta source, not
       # in a user_message — carry it so the helper card is labelled by the task
       # it was spawned for rather than left blank.
@@ -819,6 +800,30 @@ def _reset_codex_digests(model: dict, sid: str) -> None:
   for agent in model["agents"].values():
     if agent.get("sid") == sid and agent.get("run_kind") == "collab":
       _reset_agent_digest(agent)
+
+
+def _enforce_parent_invariant(model: dict) -> None:
+  """Repairs stale accumulators produced before the self-parent guard existed.
+
+  Clearing only the session field is insufficient: the old fold may already
+  have created a synthetic `sid::sid` helper and collab run for that fake child.
+  Remove that derived self-helper while preserving any real children in the same
+  run. Invariant: a session is never its own parent.
+  """
+  for sid, session in model.get("sessions", {}).items():
+    if str(session.get("parent_thread_id") or "") != sid:
+      continue
+    session["parent_thread_id"] = None
+    akey = f"{sid}::{sid}"
+    agent = model.get("agents", {}).get(akey)
+    if not agent or agent.get("run_kind") != "collab":
+      continue
+    model["agents"].pop(akey, None)
+    for rkey, run in list(model.get("runs", {}).items()):
+      if akey in run.get("agent_keys", []):
+        run["agent_keys"] = [key for key in run["agent_keys"] if key != akey]
+        if not run["agent_keys"]:
+          model["runs"].pop(rkey, None)
 
 
 def _looks_collab(payload: dict) -> bool:
@@ -888,7 +893,8 @@ def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
   parent's chat later, in attribution.
   """
   session = model["sessions"].get(sid) or {}
-  if not session.get("parent_thread_id"):
+  if (not session.get("parent_thread_id")
+      or str(session.get("parent_thread_id")) == sid):
     return
   agent = _agent(model, sid, "collab", sid, "collab")
   if not agent["agent_type"]:
@@ -962,6 +968,10 @@ class Attribution:
         return self.tooluse_to_chat[tuid], "task-tool-use"
     # 4. Codex child inherits its parent_thread_id's chat (recursively).
     parent = session.get("parent_thread_id")
+    if parent == sid:
+      # Defensive read-side enforcement for an accumulator created by an older
+      # parser: a session is never its own parent.
+      parent = None
     if parent:
       seen = _seen or set()
       if parent in seen:
@@ -1152,40 +1162,27 @@ def _split_agent_output(output) -> tuple[Optional[str], Optional[str], Optional[
           usage_hit.group(1) if usage_hit else None)
 
 
-def _usage_number(usage: Optional[str], key: str) -> Optional[int]:
-  """A usage counter, or None when it was never recorded.
-
-  None and 0 are different facts — a helper that genuinely used no tools and a
-  helper we have no metrics for must not render the same — so a missing counter
-  is never coerced to zero.
-  """
-  if not usage:
-    return None
-  hit = re.search(rf"{key}\s*:\s*(-?\d+)", usage)
-  return int(hit.group(1)) if hit else None
-
-
 _FINISHED_WORDS = {"done", "finished", "completed", "complete", "success"}
 _WORKING_WORDS = {"running", "in_progress", "in-progress", "working", "started"}
 _STOPPED_WORDS = {"stopped", "cancelled", "canceled", "interrupted", "aborted"}
 
 
-def helper_from_agent_block(block: dict, ordinal: int = 0) -> Optional[dict]:
-  """One helper record derived from an `Agent` tool block, in the agent shape
-  the chat documents already use.
+def helper_from_agent_block(block: dict, ordinal: int = 0,
+                            scope: str = "") -> Optional[dict]:
+  """One bounded helper-evidence record derived from an `Agent` tool block.
 
   The recorded status is NOT trustworthy on its own: in production, helpers
   whose payload is an outright API error are still written down as `done`. When
   the payload contradicts the status the payload wins, because a helper that
   returned an error did not do the work whatever the bookkeeping says. The
-  override is flagged so the UI can say the label was corrected rather than
-  repeat a comfortable lie.
+  payload wins, so downstream assembly never repeats a comfortable lie.
   """
   if not isinstance(block, dict):
     return None
   raw_input = block.get("input")
   raw_input = raw_input if isinstance(raw_input, str) else ""
-  body, agent_id, usage = _split_agent_output(block.get("output"))
+  body, agent_id, _usage = _split_agent_output(block.get("output"))
+  is_async = bool(body) and _ASYNC_ACK in body
 
   if body is None:
     kind = "none"
@@ -1196,24 +1193,27 @@ def helper_from_agent_block(block: dict, ordinal: int = 0) -> Optional[dict]:
 
   status_word = str(block.get("status") or "").strip().lower()
   if kind == "error":
-    state, trusted = "failed", status_word not in _FINISHED_WORDS
+    state = "failed"
+  elif is_async:
+    # The launch acknowledgement is not a completion report. A later result
+    # block or downstream transcript may supersede this working state when all
+    # evidence for the agent_id is reconciled during document assembly.
+    state = "working"
   elif status_word in _FINISHED_WORDS:
-    state, trusted = "finished", True
+    state = "finished"
   elif status_word in _WORKING_WORDS:
-    state, trusted = "working", True
+    state = "working"
   elif status_word in _STOPPED_WORDS:
-    state, trusted = "stopped", True
+    state = "stopped"
   else:
-    state, trusted = "unavailable", True
+    state = "unavailable"
 
   description = _agent_field(raw_input, "description")
   prompt = _agent_field(raw_input, "prompt")
   goal = description or ((prompt or "").split("\n")[0].strip() or None)
-  duration_ms = _usage_number(usage, "duration_ms")
-
   return {
     "agent_id": (agent_id or block.get("tool_use_id")
-                 or _stable_agent_id(goal, raw_input, ordinal)),
+                 or _stable_agent_id(goal, raw_input, ordinal, scope)),
     # description + agent_type come from arbitrary tool INPUT, so they get the
     # same scrub + cap every other free-text field that leaves this job gets —
     # a spawn prompt can quote a secret just as a report can. None stays None
@@ -1221,29 +1221,11 @@ def helper_from_agent_block(block: dict, ordinal: int = 0) -> Optional[dict]:
     "description": clip_line(goal) if goal else None,
     "agent_type": clip_line(_agent_field(raw_input, "subagent_type"), 48) or None,
     "status": state,
-    "status_overridden": not trusted,
-    "origin": "block",
-    # Scrubbed + capped like every other free-text field that leaves this job;
-    # a helper's returned payload is arbitrary text and can quote a secret. The
-    # card gets the short cap and the detail page the longer one, so the full
-    # copy is carried under a private key the merge pops before the chat
-    # document is written — the chat doc is fetched to render a list and must
-    # not haul every helper's full report along with it.
-    "reported_outcome": _cap_outcome(body) if body else None,
-    "_full_outcome": _cap_report(scrub(body)) if body else None,
-    # Gates whether the card opens a detail page. True only when the helper
-    # returned something, because that longer report is the ONLY thing the page
-    # adds over the card — a block with no payload would open onto a restatement
-    # of the card, so it stays a flat row instead of a dead tap.
-    "has_activity": bool(body),
-    # Whether the spawn was launched to run in the background rather than awaited
-    # inline. Detected HERE so there is one status authority over the block; the
-    # timeline's branch label is a pure map off this record, not a second read of
-    # the payload.
-    "is_async": bool(body) and _ASYNC_ACK in body,
-    "duration_secs": round(duration_ms / 1000) if duration_ms is not None else None,
-    "steps_count": _usage_number(usage, "tool_uses"),
-    "tokens": _usage_number(usage, "subagent_tokens"),
+    # A helper's returned payload is arbitrary text and can quote a secret.
+    "_full_outcome": _cap_report(scrub(body)) if body and not is_async else None,
+    "_brief_full": clip_prompt(prompt) or "",
+    # A launch hint only; joined terminal evidence supersedes it later.
+    "is_async": is_async,
   }
 
 
@@ -1286,7 +1268,8 @@ def _handback(blocks: list, start: int, max_actions: int = 5) -> dict:
   return {"note": note, "actions": actions, "actions_truncated": truncated}
 
 
-def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int) -> str:
+def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int,
+                     scope: str = "") -> str:
   """A deterministic id for a helper whose payload never named one, so the same
   block keeps the same identity across runs instead of churning storage.
 
@@ -1297,7 +1280,10 @@ def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int) -> str:
   thing left that separates them, and it is stable as long as the transcript is
   append-only.
   """
-  seed = f"{ordinal}|{goal or ''}|{raw_input[:200]}"
+  # `scope` is the chat id when available. v2 helper documents are globally
+  # addressed as helpers/<agent_id>.json, so identical blank/trimmed blocks in
+  # two chats must not collide.
+  seed = f"{scope}|{ordinal}|{goal or ''}|{raw_input[:200]}"
   return "blk" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:15]
 
 
@@ -1306,60 +1292,9 @@ def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int) -> str:
 # from "came back with a result", and it is NOT an error.
 _ASYNC_ACK = "Async agent launched successfully"
 
-# Ceilings so a chat doc (fetched whole to render one timeline) can't grow
-# without bound. Real turns run ~20 nodes and chats ~2 turns, so these are safety
-# valves, not everyday limits — and a trim NEVER drops a branch (the spawns are
-# the point); only condensable seg/note nodes are shed, and the turn is flagged.
+# Ceiling so a chat document cannot grow without bound. The newest tool-using
+# turns are retained; helper detail remains available in its own document.
 MAX_CHAT_TURNS = 40
-MAX_TURN_NODES = 60
-
-
-def _cap_turn_nodes(nodes: list) -> tuple[list, bool]:
-  """Keep every branch node; fill the remaining budget with seg/note nodes in
-  order. Returns (nodes, truncated). A spawn is never dropped, so the branch
-  count the header shows always matches what the rail draws."""
-  if len(nodes) <= MAX_TURN_NODES:
-    return nodes, False
-  branches = [n for n in nodes if n.get("t") == "branch"]
-  budget = max(0, MAX_TURN_NODES - len(branches))
-  kept: list = []
-  for n in nodes:
-    if n.get("t") == "branch":
-      kept.append(n)
-    elif budget > 0:
-      kept.append(n)
-      budget -= 1
-  return kept, True
-
-
-def _branch_state(helper: dict) -> str:
-  """The lifecycle a spawn reached, as the PARENT turn recorded it — a PURE MAP
-  off the one helper record `helper_from_agent_block` already produced, never a
-  second read of the block. That keeps a single status authority.
-
-  Four honest states, so nothing that halted is dressed up as progress:
-    failed   — the payload was an error, or a success status the payload
-               contradicts (payload-beats-status, already resolved in `status`).
-    stopped  — the run halted or its state is unavailable: NOT "still out", NOT
-               "merged". A neutral dead-end, consistent with the roster's
-               `stopped` bucket.
-    launched — a background launch (async ack) or still `working`: out on its own
-               with no result recorded THIS turn.
-    returned — the parent recorded it complete.
-
-  It reads only what this turn saw: a helper whose parent payload is a clean
-  async ack but whose OWN downstream transcript later failed reads as `launched`
-  here. Correcting that needs the subagent-transcript join (separate timing
-  work), deliberately out of scope.
-  """
-  status = helper.get("status")
-  if status == "failed" or helper.get("status_overridden"):
-    return "failed"
-  if status in ("stopped", "unavailable"):
-    return "stopped"
-  if status == "working" or helper.get("is_async"):
-    return "launched"
-  return "returned"
 
 
 # A spawn prompt / brief can be long; cap it generously enough to be a real
@@ -1380,8 +1315,7 @@ def clip_prompt(text: Optional[str]) -> Optional[str]:
 def clip_markdown(text: Optional[str], cap: int) -> Optional[str]:
   """Scrub + cap a free-text field but KEEP newlines, so the renderer can see
   markdown structure (bullets, paragraphs). `clip_line` flattens newlines to
-  spaces and would collapse a list into one run-on line — wrong for anything
-  rendered as markdown (gist, notes)."""
+  spaces and would collapse a list into one run-on line."""
   if not text:
     return None
   out = scrub(str(text)).strip()
@@ -1390,133 +1324,85 @@ def clip_markdown(text: Optional[str], cap: int) -> Optional[str]:
   return out[:cap - 1] + "…" if len(out) > cap else out
 
 
-def _seg_node(run_blocks: list) -> dict:
-  """Condense a maximal run of consecutive non-spawn tool blocks into one node:
-  a tool tally (by descending count) and up to three short input samples, so a
-  160-block turn reads as a handful of nodes rather than 160 rows."""
-  tally: dict[str, int] = {}
-  peek: list[str] = []
-  for b in run_blocks:
-    tool = str(b.get("tool") or "tool")
-    tally[tool] = tally.get(tool, 0) + 1
-    if len(peek) < 3:
-      sample = clip_line(scrub(str(b.get("input") or "")).strip(), 60)
-      if sample:
-        peek.append(sample)
-  ordered = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
-  return {
-    "t": "seg",
-    "steps": len(run_blocks),
-    "tally": [{"tool": t, "n": n} for t, n in ordered],
-    "peek": peek,
-  }
+def _owner_request(text: str) -> str:
+  """Remove injected context envelopes before using the first user request.
+
+  Restored legacy chats can prepend `<agent_context>...</agent_context>` to the
+  owner's actual message. Treating that system-owned prelude as a title source
+  produced titles such as "<agent_context> # Agent experience".
+  """
+  out = scrub(text).strip()
+  envelope = re.compile(
+    r"^\s*<(?:agent_context|environment_context|system-reminder)>[\s\S]*?"
+    r"</(?:agent_context|environment_context|system-reminder)>\s*", re.I)
+  while envelope.match(out):
+    out = envelope.sub("", out, count=1).strip()
+  return _cap_report(out)
 
 
-def _flush_seg(nodes: list, run: list) -> list:
-  """Emit the buffered tool run as a seg node (if any) and start a fresh buffer.
-  Returned so the caller rebinds without a closure over a mutable list."""
-  if run:
-    nodes.append(_seg_node(run))
-  return []
+def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]:
+  """Collect helper evidence and every tool-using assistant turn in one pass.
 
-
-def _walk_chat(messages: list) -> tuple[list[dict], list[dict]]:
-  """One ordered pass over a chat's messages, producing BOTH the helper records
-  and the timeline turns.
-
-  They are built together on purpose: a branch node and its helper record must
-  share one `agent_id` (the tap-through contract), and the helper ordinal is the
-  running helper count exactly as the earlier flat scan produced it — so this
-  refactor does not churn a single id. Only an assistant message that actually
-  spawned a helper becomes a turn; a text block is a note, a run of ordinary tool
-  calls collapses into one seg, and each spawn is a branch.
+  v2 deliberately includes a tool turn even when it did not spawn a helper: the
+  owner's requested Beat Machine validator example is such a turn, and omitting
+  it would make the outcome journal skip the exact handback that needs review.
+  Private `_tools`/`_agent_ids` fields are bounded, scrubbed parse evidence; the
+  public document is derived from them later after downstream helpers are joined.
   """
   helpers: list[dict] = []
   turns: list[dict] = []
+  first_request = ""
+  last_user_ts = None
   for msg in messages:
     if not isinstance(msg, dict):
       continue
-    blocks = msg.get("blocks") or []
-    if not any(isinstance(b, dict) and b.get("type") == "tool"
-               and b.get("tool") in SPAWNING_TOOL_NAMES for b in blocks):
+    if msg.get("role") == "user":
+      content = msg.get("content")
+      if isinstance(content, str) and content.strip() and not first_request:
+        first_request = _owner_request(content)
+      if isinstance(msg.get("ts"), (int, float, str)):
+        last_user_ts = msg.get("ts")
       continue
-    nodes: list[dict] = []
-    run: list[dict] = []
-    note_idx: list[int] = []
+    blocks = msg.get("blocks") or []
+    if not any(isinstance(b, dict) and b.get("type") == "tool" for b in blocks):
+      continue
     note_texts: list[str] = []
-    nspawn = 0
+    tools: list[dict] = []
+    agent_ids: list[str] = []
     for index, block in enumerate(blocks):
       if not isinstance(block, dict):
         continue
       btype = block.get("type")
       if btype == "text":
-        text = clip_markdown(block.get("content"), 300)
-        if not text:
-          continue
-        run = _flush_seg(nodes, run)
-        note_idx.append(len(nodes))
-        note_texts.append(text)
-        nodes.append({"t": "note", "role": "post", "text": text})
+        text = clip_markdown(block.get("content"), FINAL_REPORT_CAP)
+        if text:
+          note_texts.append(text)
       elif btype == "tool":
         if block.get("tool") in SPAWNING_TOOL_NAMES:
-          run = _flush_seg(nodes, run)
-          record = helper_from_agent_block(block, ordinal=len(helpers))
+          record = helper_from_agent_block(
+            block, ordinal=len(helpers), scope=scope)
           if not record:
             continue
           handback = _handback(blocks, index)
           record["_handback"] = handback
-          if handback["note"] or handback["actions"]:
-            record["has_activity"] = True
           helpers.append(record)
-          nspawn += 1
-          raw_in = block.get("input") if isinstance(block.get("input"), str) else ""
-          nodes.append({
-            "t": "branch",
-            "state": _branch_state(record),
-            # null (not an invented placeholder) when unrecorded; the UI shows a
-            # static "Helper" label rather than assert a description we lack.
-            "desc": record.get("description"),
-            # null when unrecorded — the view omits the chip rather than assert a
-            # type/model we don't have.
-            "agent": record.get("agent_type"),
-            "model": clip_line(_agent_field(raw_in, "model"), 48) or None,
-            "async": bool(record.get("is_async")),
-            # The recorded PREVIEW of the brief the spawn was given — NOT the
-            # helper's runtime system prompt, and often clipped at the API's
-            # ~200-char tool-input ceiling. Labelled "Instructions" in the UI and
-            # never presented as complete. Scrubbed like every other field.
-            "prompt_excerpt": clip_prompt(_agent_field(raw_in, "prompt")),
-            # Whether tapping the branch opens a detail page — the SAME gate the
-            # agent page is written under, so a branch never navigates to an
-            # empty view (no dead-end taps).
-            "tappable": bool(record.get("has_activity")),
-            "agent_id": record.get("agent_id"),
-          })
+          agent_ids.append(str(record["agent_id"]))
         else:
-          run.append(block)
-    run = _flush_seg(nodes, run)
-    # positional note flavour: the first note frames what's about to happen, the
-    # last is the turn's closing word, the rest are mid-turn asides.
-    if note_idx:
-      nodes[note_idx[0]]["role"] = "pre"
-      nodes[note_idx[-1]]["role"] = "final"
-    # The high-level gist is the turn's own closing note (its outcome), captured
-    # BEFORE node truncation so a long turn whose final note falls past the node
-    # cap still shows it; the opening note is the fallback. Never a generated
-    # summary — always the agent's own recorded words.
-    gist = note_texts[-1] if note_texts else None
-    capped, truncated = _cap_turn_nodes(nodes)
+          tools.append({
+            "tool": clip_line(str(block.get("tool") or "tool"), 80),
+            "status": clip_line(str(block.get("status") or ""), 40),
+            "input": clip_markdown(str(block.get("input") or ""), 1600) or "",
+            "output": clip_markdown(str(block.get("output") or ""), 2400) or "",
+          })
     turns.append({
-      "ts": msg.get("ts") if isinstance(msg.get("ts"), int) else None,
-      "nspawn": nspawn,
+      "ts": msg.get("ts") if isinstance(msg.get("ts"), (int, float, str)) else last_user_ts,
       "nblocks": len(blocks),
-      "gist": gist,
-      "nodes": capped,
-      "truncated": truncated,
+      "_agent_ids": agent_ids,
+      "_tools": tools,
+      "_original": note_texts[-1] if note_texts else "",
+      "_first_request": first_request,
     })
-  # Keep the NEWEST turns when a chat runs long (messages arrive oldest-first, so
-  # slice from the end); a slice from the front would pin the view to ancient
-  # history and hide the latest work.
+  # Messages arrive oldest-first; retain the newest bounded window.
   return helpers, turns[-MAX_CHAT_TURNS:]
 
 
@@ -1561,7 +1447,7 @@ def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
       continue
     scanned[chat_id] = activity
     rescanned.add(chat_id)
-    helpers, turns = _walk_chat(payload.get("messages", []))
+    helpers, turns = _walk_chat(payload.get("messages", []), scope=chat_id)
     if helpers:
       out[chat_id] = helpers
     if turns:
@@ -1610,13 +1496,11 @@ def _api_get_json(base_url: str, path: str, token: str) -> tuple[Optional[int], 
 def derive_status(agent: dict, now: float) -> str:
   """Maps a helper digest to the frozen status vocabulary from ARTIFACTS ONLY.
 
-  Order matters: source-expired and explicit failure win over completeness, and
-  a fresh transcript reads as "working" before a present-but-not-final report
-  reads as "finished" — so a still-streaming helper is never prematurely
-  marked done.
+  Order matters: explicit terminal failure/result wins over every launch or
+  freshness hint. A final report from an expired source is still terminal
+  evidence; expiration only means the internal trail is no longer available.
+  A fresh transcript remains working before a non-journal final note is accepted.
   """
-  if agent.get("source_expired"):
-    return "unavailable"
   if agent.get("board_status") == "failed" or _result_is_failure(agent.get("result")):
     return "failed"
   if _result_is_success(agent.get("result")):
@@ -1625,6 +1509,8 @@ def derive_status(agent: dict, now: float) -> str:
     return "working"
   if agent.get("final_report"):
     return "finished"
+  if agent.get("source_expired"):
+    return "unavailable"
   if agent.get("has_activity"):
     return "stopped"
   return "unavailable"
@@ -1658,129 +1544,475 @@ def _is_fresh(ts_iso: Optional[str], now: float) -> bool:
   return epoch is not None and (now - epoch) < FRESH_SECS
 
 
-def _card_label(agent: dict) -> Optional[str]:
-  """The short assignment shown on the helper card.
+# --- document assembly ------------------------------------------------------
 
-  A Task-tool helper carries an explicit `description` in its meta.json; a
-  workflow-spawned helper does not (its meta is only `{agentType, spawnDepth}`),
-  so its assignment lives in the first line of its `goal` — the prompt it was
-  handed. Fall back to that first line so a workflow helper's card is labelled
-  by what it was asked to do rather than left blank. None when neither exists,
-  so the UI can render a neutral placeholder instead of an empty string.
+_APP_NOUNS = {
+  "10": "Beat Machine", "12": "News", "39": "Reflection",
+  "89": "Workflows", "beat-machine": "Beat Machine",
+  "beatmachine": "Beat Machine", "news": "News", "notes": "Notes",
+  "workflows": "Workflows", "reflection": "Reflection",
+  "habit-tracker": "Habit Tracker", "recipes": "Recipes",
+  "cuberun": "CubeRun", "cube-run": "CubeRun",
+}
+
+_DELIVERY_START = re.compile(
+  r"^(?:done\b|fixed\b|added\b|built\b|here(?:'|’)s\b|updated\b|replaced\b|created\b|removed\b)", re.I)
+_PROCEDURAL_START = re.compile(
+  r"^(?:let me\b|let(?:'|’)s\b|checking\b|server\b|now\b|next\b|then\b|first\b|curl\b|bash\b|python\b|grep\b|npm\b|pnpm\b|\$)", re.I)
+_NEGATIVE_EVIDENCE = re.compile(
+  r"(?:\"valid\"\s*:\s*false|\b(?:failed|failure|error|invalid)\b|won't mount|does not load|not found)", re.I)
+_POSITIVE_EVIDENCE = re.compile(
+  r"(?:\"valid\"\s*:\s*true|\btests? pass(?:ed)?\b|\bverified\b|\bvalidation passed\b|\bbuild succeeded\b)", re.I)
+_VERIFY_COMMAND = re.compile(
+  r"(?:pytest|vitest|jest|npm\s+(?:run\s+)?(?:test|build|lint)|pnpm\s+(?:test|build|lint)|/validate\b|validator\b|\btsc\b|playwright)", re.I)
+_HEDGE_EVIDENCE = re.compile(
+  r"(?:\bnot\s+100%\s+sure\b|\bhopefully\b|\bi\s+(?:think|believe)\b|"
+  r"\bin\s+(?:theory|principle)\b|\bassuming\b|\bpresumably\b|"
+  r"\b(?:should(?:\s+be)?|ought\s+to|likely(?:\s+to)?|probably(?:\s+will)?|"
+  r"might|may)\s+(?:now\s+|still\s+|not\s+)*(?:be\s+)?"
+  r"(?:work(?:ing)?|load(?:ing)?|open(?:ing)?|render(?:ing)?|run(?:ning)?|"
+  r"show(?:ing)?|display(?:ing)?|behave|succeed|pass|survive|hold|"
+  r"fine|okay|ok|ready|done|complete|correct|good|stable|safe)\b|"
+  r"\b(?:i|we)\s+(?:(?:will|can)\s+|(?:'|’)ll\s+)?(?:try|attempt)\b)", re.I)
+_STOPPED_EVIDENCE = re.compile(
+  r"(?:\bcould(?:n(?:'|’)t| not)\s+complete\b|\bunable\s+to\s+complete\b|"
+  r"\b(?:the\s+)?work\s+stopped\b|\bi\s+stopped\s+(?:the\s+)?work\b)", re.I)
+
+
+def _canonical_state(value: Optional[str]) -> str:
+  state = str(value or "").lower()
+  if state in ("done", "finished", "returned", "complete", "completed"):
+    return "done"
+  if state in ("running", "working", "launched", "in_progress", "inprogress"):
+    return "running"
+  if state in ("failed", "error"):
+    return "failed"
+  return "stopped"
+
+
+def _resolved_state(states: Iterable[str]) -> str:
+  """One lifecycle answer for every surface.
+
+  Evidence is joined by agent_id before this is called. Terminal evidence is
+  more resolved than a launch acknowledgement: failure wins, then a returned
+  result, then a terminal stop, and only then an unresolved running/launch
+  record. This precedence is shared by roster, turn cards, and helper pages.
   """
-  desc = clip_line(agent.get("description", ""), 200)
-  if desc:
-    return desc
-  goal = (agent.get("goal") or "").strip()
-  if not goal:
-    return None
-  first_line = goal.splitlines()[0].strip()
-  return clip_line(first_line, 200) or None
+  values = {_canonical_state(s) for s in states}
+  for state in ("failed", "done", "stopped", "running"):
+    if state in values:
+      return state
+  return "stopped"
 
 
-def _reported_outcome(agent: dict) -> Optional[str]:
-  """The helper's OWN completion words, scrubbed + capped, or None (never a
-  fabricated gap). Prefers a structured journal summary, then the final report;
-  a still-open helper with neither stays None."""
+def _plain_ask(text: Optional[str]) -> str:
+  line = clip_line(str(text or ""), 240)
+  line = re.sub(
+    r"^(?:please\s+|your task is to\s+|i need you to\s+|i need to\s+)",
+    "", line, flags=re.I).strip()
+  return line or "No brief was recorded"
+
+
+def _kind_and_name(agent_type: Optional[str], provider: str = "") -> tuple[str, str]:
+  raw = f"{agent_type or ''} {provider}".lower()
+  if any(word in raw for word in ("explore", "research", "search")):
+    return "explore", "Explorer"
+  if "codex" in raw:
+    return "codex", "Codex"
+  if any(word in raw for word in ("build", "implement", "frontend", "code")):
+    return "build", "Helper"
+  return "general", "Helper"
+
+
+def _tool_verb(tool: str) -> tuple[str, str]:
+  name = tool.lower().replace("-", "_")
+  if name in ("read", "read_file"):
+    return "read", "files"
+  if name in ("edit", "multiedit", "apply_patch", "applypatch"):
+    return "edited", "files"
+  if name in ("write", "write_file", "create_file"):
+    return "wrote", "files"
+  if name in ("bash", "shell", "exec_command", "run_command"):
+    return "ran", "commands"
+  if name in ("grep", "glob", "rg", "search", "find"):
+    return "searched", "code"
+  return "used", "tools"
+
+
+def _did_from_tools(tools: list[dict]) -> list[dict]:
+  counts: dict[tuple[str, str], int] = {}
+  for tool in tools:
+    key = _tool_verb(str(tool.get("tool") or "tool"))
+    counts[key] = counts.get(key, 0) + 1
+  ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0][0]))[:4]
+  return [{"verb": verb, "label": label, "count": count}
+          for (verb, label), count in ordered]
+
+
+def _acts_from_did(did: list[dict]) -> list[str]:
+  return [f"{step['verb']} ×{step['count']}" for step in did]
+
+
+def _commands_from_tools(tools: list[dict], cap: int = 12) -> list[str]:
+  commands: list[str] = []
+  for tool in tools:
+    detail = clip_line(str(tool.get("input") or ""), 240)
+    if detail and detail not in commands:
+      commands.append(detail)
+    if len(commands) >= cap:
+      break
+  return commands
+
+
+def _trace_evidence(agent: dict, now: float, provider: str) -> dict:
+  status = _canonical_state(derive_status(agent, now))
+  tools = [{"tool": str(step.get("title") or "tool"),
+            "input": str(step.get("detail") or ""), "output": "",
+            "status": ""} for step in agent.get("steps", [])]
   result = agent.get("result")
+  structured = ""
   if isinstance(result, dict):
-    for key in ("summary", "message", "verdict"):
-      if result.get(key):
-        return _cap_outcome(str(result[key]))
-  elif isinstance(result, str) and result.strip():
-    return _cap_outcome(result)
-  if agent.get("final_report"):
-    return _cap_outcome(agent["final_report"])
+    structured = next((str(result[k]) for k in ("summary", "message", "verdict")
+                       if result.get(k)), "")
+  elif isinstance(result, str):
+    structured = result
+  report = _cap_report(agent.get("final_report") or structured)
+  brief = clip_prompt(agent.get("goal")) or ""
+  return {
+    "agent_id": str(agent["agent_id"]), "agent_type": agent.get("agent_type") or "",
+    "ask": _plain_ask(agent.get("description") or agent.get("goal")),
+    "brief_full": brief, "state": status, "report_full": report,
+    "tools": tools, "next": "", "provider": provider, "origin": "trace",
+    "ts": agent.get("started_at") or agent.get("last_ts"),
+  }
+
+
+def _next_from_handback(handback: dict) -> str:
+  if not isinstance(handback, dict):
+    return ""
+  if handback.get("note"):
+    return clip_line(str(handback["note"]), 280)
+  actions = handback.get("actions") or []
+  if actions:
+    action = actions[0]
+    tool = str(action.get("tool") or "tool").lower()
+    target = str(action.get("target") or "").strip()
+    return clip_line(f"Next, the chat used {tool}{' on ' + target if target else ''}.", 280)
+  return ""
+
+
+def _block_evidence(helper: dict, provider: str) -> dict:
+  return {
+    "agent_id": str(helper["agent_id"]),
+    "agent_type": helper.get("agent_type") or "",
+    "ask": _plain_ask(helper.get("description") or helper.get("_brief_full")),
+    "brief_full": helper.get("_brief_full") or "",
+    "state": _canonical_state(helper.get("status")),
+    "report_full": helper.get("_full_outcome") or "",
+    "tools": [], "next": _next_from_handback(helper.get("_handback") or {}),
+    "provider": provider, "origin": "block", "ts": None,
+  }
+
+
+def _delivery_sentence(text: Optional[str]) -> Optional[str]:
+  raw = scrub(str(text or "")).strip()
+  if not raw:
+    return None
+  sentences = [clip_line(s, OUTCOME_CAP) for s in
+               re.split(r"(?<=[.!?])\s+|\n+", raw) if s.strip()]
+  for sentence in sentences:
+    cleaned = re.sub(r"^[#>*\-\d.\s]+", "", sentence).strip()
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    empty_lead = re.match(
+      r"^(?:done[.!]?|here(?:'|’)s (?:what (?:changed|i changed)|what i did):?)$",
+      cleaned, re.I)
+    if (_DELIVERY_START.match(cleaned) and not _PROCEDURAL_START.match(cleaned)
+        and not empty_lead and not re.search(r"(?:/data/|/app/)", cleaned)):
+      cleaned = cleaned.rstrip().removesuffix(":").rstrip()
+      if not cleaned:
+        continue
+      return cleaned[:1].upper() + cleaned[1:]
   return None
 
 
-def _cap_outcome(text: str) -> str:
-  out = scrub(text).strip()
-  return out[:OUTCOME_CAP - 1] + "…" if len(out) > OUTCOME_CAP else out
+def _plain_result(report: str, state: str) -> str:
+  if state == "failed":
+    return "A failure was recorded; the technical report has the original details."
+  if not report:
+    return ""
+  delivery = _delivery_sentence(report)
+  if delivery:
+    return delivery
+  for part in re.split(r"(?<=[.!?])\s+|\n+", report):
+    line = clip_line(part, 240)
+    if line and not _PROCEDURAL_START.match(line):
+      return line
+  return ""
 
 
-# --- document assembly ------------------------------------------------------
+def _merge_evidence(records: list[dict], provider: str) -> dict:
+  state = _resolved_state(r.get("state", "stopped") for r in records)
+  # Prefer a report attached to the resolved terminal state, then downstream
+  # trace words, then any recorded report. Async acknowledgements were removed
+  # at parse time and can never masquerade as a report here.
+  reports = [r for r in records if r.get("report_full")]
+  reports.sort(key=lambda r: (
+    r.get("state") == state, r.get("origin") == "trace",
+    len(r.get("report_full") or "")), reverse=True)
+  report = reports[0]["report_full"] if reports else ""
+  briefs = [r.get("brief_full") or "" for r in records]
+  asks = [r.get("ask") or "" for r in records
+          if r.get("ask") and r.get("ask") != "No brief was recorded"]
+  types = [r.get("agent_type") or "" for r in records if r.get("agent_type")]
+  tools = [tool for r in records for tool in r.get("tools", [])]
+  next_lines = [r.get("next") or "" for r in records if r.get("next")]
+  kind, name = _kind_and_name(types[0] if types else "", provider)
+  did = _did_from_tools(tools)
+  return {
+    "agent_id": records[0]["agent_id"], "kind": kind, "name": name,
+    "ask": asks[0] if asks else "No brief was recorded",
+    "state": state, "acts": _acts_from_did(did),
+    "result": _plain_result(report, state),
+    "brief_full": max(briefs, key=len) if briefs else "",
+    "tappable": True, "did": did, "report_full": report,
+    "next": next_lines[-1] if next_lines else "",
+    "commands": _commands_from_tools(tools), "_tools": tools,
+    "ts": next((r.get("ts") for r in records if r.get("ts")), None),
+  }
 
-def _merge_chat_helpers(chats: dict[str, dict], attribution: Attribution,
-                        chat_helpers: dict[str, list[dict]],
-                        agents_out: dict[tuple[str, str], dict]) -> None:
-  """Folds block-derived helpers into the chat documents and their agent pages.
 
-  These carry no step list — the block records the spawn and the result, not
-  the helper's internal trail — so they land as their own run rather than being
-  merged into a trace-derived one, and each page is marked `origin: "block"`.
-  That flag is what lets the reader tell "no trail was ever recorded for this
-  helper" apart from "the trail existed and has since aged out"; both would
-  otherwise render as the same empty view and quietly misdescribe the data.
+def _owner_noun(parts: Iterable[str]) -> str:
+  text = "\n".join(str(part or "") for part in parts)
+  apps: set[str] = set()
+  for slug in re.findall(r"/data/apps/([A-Za-z0-9_-]+)", text):
+    noun = _APP_NOUNS.get(slug.lower())
+    if noun:
+      apps.add(noun)
+    elif not slug.isdigit() and slug.lower() not in ("shared", "state"):
+      apps.add(slug.replace("_", "-").replace("-", " ").title())
+  for app_id in re.findall(r"(?:/api/apps/|/data/compiled/app-)(\d+)", text):
+    if app_id in _APP_NOUNS:
+      apps.add(_APP_NOUNS[app_id])
+  if len(apps) > 1:
+    return f"{len(apps)} mini-apps"
+  if apps:
+    return next(iter(apps))
+  low = text.lower()
+  if "/data/shell/" in low:
+    return "the chat UI"
+  if "theme.css" in low or "/data/shared/" in low:
+    return "mini-app styling"
+  return "the platform"
 
-  A chat the local traces could not attribute gets its document created here,
-  which is the whole point of this route: the block always knows its own chat.
+
+def _request_noun(request: str) -> Optional[str]:
+  """A high-confidence app/site name for a not-yet-created source directory.
+
+  Keep this deliberately narrow: `building Name — description` is a naming
+  construction, while a generic request such as `build a period tracking app`
+  is a description and should not be promoted into a guessed product name.
   """
-  for chat_id, helpers in chat_helpers.items():
-    if not helpers:
-      continue
-    doc = chats.get(chat_id)
-    if doc is None:
-      doc = _empty_chat_doc(chat_id, attribution, {})
-      chats[chat_id] = doc
-    known = {
-      a.get("agent_id")
-      for run in doc["runs"] for a in run.get("agents", [])
-    }
-    fresh = [h for h in helpers if h.get("agent_id") not in known]
-    if not fresh:
-      continue
-    summaries = []
-    for helper in fresh:
-      if helper.get("has_activity"):
-        agents_out[(chat_id, helper["agent_id"])] = {
-          "schema": SCHEMA_VERSION,
-          "goal": clip_line(helper.get("description") or "", 400),
-          "agent_type": helper.get("agent_type") or "unknown",
-          "steps": [],
-          "final_report": helper.get("_full_outcome") or "",
-          "truncated": False,
-          "source_expired": False,
-          "origin": "block",
-          "status_overridden": bool(helper.get("status_overridden")),
-          # What the chat did once this helper reported back. Lives on the page
-          # rather than the card because the chat document is fetched to render
-          # a list and should not carry every helper's follow-on with it.
-          "handback": helper.get("_handback") or {},
-        }
-      # Copy rather than mutate: `helper` belongs to the cached scan state that
-      # is written back to disk and reused for chats whose activity has not
-      # changed. Popping the private key here would blank every detail page on
-      # the NEXT run, when the reloaded record no longer carries the report.
-      summaries.append({k: v for k, v in helper.items() if not k.startswith("_")})
-    doc["runs"].append({
-      "run_id": "chat-agents",
-      "kind": "tasks",
-      "label": "Helpers spawned in this chat",
-      "started_at": None,
-      "ended_at": None,
-      "agents": summaries,
-      "capabilities": {
-        "has_saved_plan": False,
-        "has_usage": any(h.get("tokens") is not None for h in fresh),
-        "has_live_progress": False,
-      },
-    })
+  text = scrub(request).strip()
+  hit = re.search(
+    r"\b(?:building|creating)\s+([A-ZÀ-ÖØ-Þ][^—–\n]{1,60}?)\s+[—–]\s+",
+    text)
+  if not hit:
+    return None
+  noun = clip_line(hit.group(1).strip(" \t.,:;\"'“”‘’"), 80)
+  return noun or None
+
+
+def _has_change(tools: list[dict]) -> bool:
+  for tool in tools:
+    name = str(tool.get("tool") or "").lower()
+    detail = str(tool.get("input") or "")
+    if name in ("edit", "multiedit", "write", "apply_patch", "applypatch", "create_file"):
+      return True
+    if re.search(r"(?:curl\b[^\n]*\s-X\s+(?:PATCH|POST|PUT|DELETE)\b|\brm\s|\bmv\s|\bcp\s|sed\s+-i\b)", detail, re.I):
+      return True
+  return False
+
+
+def _turn_verb(tools: list[dict]) -> str:
+  names = {str(t.get("tool") or "").lower() for t in tools}
+  if names & {"write", "create_file", "write_file"} and not names & {"edit", "multiedit", "apply_patch"}:
+    return "Built"
+  if names & {"edit", "multiedit", "write", "apply_patch", "applypatch", "create_file"}:
+    return "Updated"
+  return "Investigated"
+
+
+def _verification_signal(tools: list[dict], original: str) -> str:
+  signal = "none"
+  for tool in tools:
+    status = str(tool.get("status") or "").lower()
+    command = str(tool.get("input") or "")
+    output = str(tool.get("output") or "")
+    if status in ("failed", "error"):
+      signal = "failed"
+    elif _VERIFY_COMMAND.search(command) and _NEGATIVE_EVIDENCE.search(output):
+      signal = "failed"
+    elif _VERIFY_COMMAND.search(command) and _POSITIVE_EVIDENCE.search(output):
+      signal = "confirmed"
+  if signal != "none":
+    return signal
+  if (_POSITIVE_EVIDENCE.search(original)
+      and not re.search(r"\b(?:should|might|could|hopefully|seems?|appears?)\b", original, re.I)):
+    return "confirmed"
+  return "none"
+
+
+def _hedges_result(original: str) -> bool:
+  """Whether the agent's own closing words express positive doubt.
+
+  Missing test evidence is deliberately not doubt. This only examines the
+  agent-authored report, never the user's request or tool output, so words such
+  as "may" in a brief cannot turn an otherwise ordinary edit amber.
+  """
+  return bool(_HEDGE_EVIDENCE.search(original))
+
+
+def _turn_stopped(original: str) -> bool:
+  """An explicit owner-turn stop is doubt even without a helper lifecycle."""
+  return bool(_STOPPED_EVIDENCE.search(original))
+
+
+def _found_cause(original: str) -> bool:
+  return bool(re.search(
+    r"\b(?:root cause|the (?:issue|problem|cause) (?:is|was)|caused by|confirmed\s+.{0,30}\b(?:issue|problem))\b",
+    original, re.I))
+
+
+def _coerce_iso(value) -> Optional[str]:
+  if isinstance(value, (int, float)):
+    epoch = float(value) / 1000 if value > 10_000_000_000 else float(value)
+    return _epoch_to_iso(epoch)
+  if isinstance(value, str) and value.strip():
+    return value.strip()
+  return None
+
+
+def _build_v2_turn(raw: dict, helpers: dict[str, dict],
+                   request_hint: str = "") -> dict:
+  subs = [helpers[aid] for aid in raw.get("_agent_ids", []) if aid in helpers]
+  # Preserve one card per helper in a turn even when an async ack and later result
+  # block both named the same agent_id.
+  subs = list({sub["agent_id"]: sub for sub in subs}.values())
+  tools = list(raw.get("_tools", [])) + [tool for sub in subs for tool in sub.get("_tools", [])]
+  original = _cap_report(str(raw.get("_original") or ""))
+  area = _owner_noun(
+    [t.get("input", "") for t in tools] +
+    [sub.get("brief_full", "") for sub in subs])
+  if area == "the platform":
+    area = (_request_noun(str(raw.get("_first_request") or ""))
+            or _request_noun(request_hint) or area)
+  verb = _turn_verb(tools)
+  neutral = f"{verb} {area}"
+  states = [sub["state"] for sub in subs]
+  verification = _verification_signal(tools, original)
+  changed = _has_change(tools)
+
+  flag = None
+  if "failed" in states:
+    status, result = "attention", "couldn't complete"
+    flag = "A helper reported a failure, so this turn needs a look."
+  elif "running" in states:
+    status, result = "running", "in progress"
+  elif "stopped" in states:
+    status, result = "attention", "stopped"
+    flag = "The recorded work stopped without a completion result."
+  elif verification == "failed":
+    status, result = "attention", "not confirmed"
+    flag = f"The recorded check for {area} failed, so the claimed result was not confirmed."
+  elif _turn_stopped(original):
+    status, result = "attention", "stopped"
+    flag = "The recorded work stopped without a completion result."
+  elif _hedges_result(original):
+    status, result = "attention", "not confirmed"
+    flag = f"The recorded report for {area} hedged the result, so it was not confirmed."
+  else:
+    status = "done"
+    result = "found the cause" if not changed and _found_cause(original) else "done"
+
+  delivery = _delivery_sentence(original)
+  # A delivery claim is only a hero line when the evidence supports `done`.
+  # Attention/running turns stay neutral and put the caveat in `flag`.
+  outcome = delivery if status == "done" and delivery else neutral
+  public_subs = [{k: v for k, v in sub.items() if not k.startswith("_") and
+                  k not in ("did", "report_full", "next", "commands", "ts")}
+                 for sub in subs]
+  return {
+    "outcome": clip_line(outcome, OUTCOME_CAP), "area": area,
+    "result": result, "status": status, "flag": flag,
+    "ts": _coerce_iso(raw.get("ts")), "subs": public_subs,
+    "original": original, "commands": _commands_from_tools(tools),
+    "nblocks": int(raw.get("nblocks") or 0),
+  }
+
+
+def _trace_turn(run: dict, agents: list[dict]) -> dict:
+  tools = [tool for agent in agents for tool in agent.get("tools", [])]
+  reports = [agent.get("report_full") or "" for agent in agents if agent.get("report_full")]
+  return {
+    "ts": run.get("started_at") or next((a.get("ts") for a in agents if a.get("ts")), None),
+    "nblocks": len(tools), "_agent_ids": [a["agent_id"] for a in agents],
+    "_tools": [], "_original": reports[-1] if reports else "",
+    "_first_request": "",
+  }
+
+
+def _title_is_raw(title: str) -> bool:
+  value = title.strip()
+  if not value or value.lower() in ("new chat", "untitled chat"):
+    return True
+  if re.match(r"^(?:could|can|would|will) you\b|^please\b|^i (?:need|want|can't|am)\b|^so\b", value, re.I):
+    return True
+  if "```" in value or value.startswith("<"):
+    return True
+  return 36 <= len(value) <= 44 and value[-1].isalnum()
+
+
+def _title_from_request(request: str, area: str, changed: bool) -> str:
+  clean = clip_line(request, 180)
+  clean = clean.split("```", 1)[0].strip()
+  clean = re.sub(
+    r"^(?:(?:could|can|would|will) you(?: please)?|please)\s+", "", clean,
+    flags=re.I).strip()
+  clean = re.sub(r"^(?:i (?:want|need)(?: you)? to|so)\s+", "", clean,
+                 flags=re.I).strip()
+  clean = re.sub(r"^(?:i(?:'|’)m|i am)\s+", "", clean, flags=re.I).strip()
+  clean = re.sub(r"^build me\s+", "Build ", clean, flags=re.I).strip()
+  clean = re.split(r"[.!?\n]", clean)[0].strip()
+  words = clean.split()
+  if words:
+    candidate = " ".join(words[:10]).rstrip(" ,;:-")
+    return candidate[:1].upper() + candidate[1:]
+  if area == "the platform":
+    return "Background work"
+  return f"{area} {'update' if changed else 'investigation'}"
+
+
+def _chat_status(turns: list[dict]) -> tuple[str, str]:
+  if not turns:
+    return "done", "done"
+  running = [turn for turn in turns if turn["status"] == "running"]
+  if running:
+    return "running", "in progress"
+  # The journal entry describes where the chat ended. Older unverified turns
+  # stay visible in drill-in but do not keep a chat in "Needs you" after a later
+  # turn resolved the work.
+  return turns[-1]["status"], turns[-1]["result"]
 
 
 def build_documents(model: dict, attribution: Attribution, now: float,
                     chat_helpers: Optional[dict[str, list[dict]]] = None,
                     chat_turns: Optional[dict[str, list[dict]]] = None
-                    ) -> tuple[dict, dict[str, dict], dict[tuple[str, str], dict]]:
-  """Rebuilds the three storage-document families from the accumulator.
-
-  Returns `(index, chats_by_id, agents_by_key)` where an agent key is
-  `(chat_id, agent_id)`. Attribution runs here so a chat gathers exactly the
-  runs whose session resolves to it; unresolved sessions become unlinked rows.
-  """
+                    ) -> tuple[dict, dict[str, dict], dict[str, dict], dict[str, dict]]:
+  """Rebuild schema-v2 journal, chat, and globally-addressed helper documents."""
   sessions = model["sessions"]
-  chats: dict[str, dict] = {}
-  agents_out: dict[tuple[str, str], dict] = {}
+  evidence: dict[str, dict[str, list[dict]]] = {}
+  synthetic_turns: dict[str, list[dict]] = {}
+  providers: dict[str, str] = {}
   unlinked: dict[str, dict] = {}
 
   # Group runs by resolved chat. A session with no runs but that resolves to a
@@ -1802,116 +2034,87 @@ def build_documents(model: dict, attribution: Attribution, now: float,
       })
       row["helpers"] += sum(len(r["agent_keys"]) for r in runs)
       continue
-    chat_doc = chats.setdefault(chat_id, _empty_chat_doc(chat_id, attribution, session))
+    provider = attribution.chats.get(chat_id, {}).get("provider") or session.get("provider") or "claude"
+    providers[chat_id] = provider
     for run in runs:
-      run_doc, run_agents = _build_run(run, chat_id, model, now)
-      chat_doc["runs"].append(run_doc)
-      agents_out.update(run_agents)
+      run_evidence = []
+      for akey in run["agent_keys"]:
+        agent = model["agents"].get(akey)
+        if not agent:
+          continue
+        item = _trace_evidence(agent, now, provider)
+        evidence.setdefault(chat_id, {}).setdefault(item["agent_id"], []).append(item)
+        run_evidence.append(item)
+      if run_evidence:
+        synthetic_turns.setdefault(chat_id, []).append(_trace_turn(run, run_evidence))
 
-  # Fold in helpers read straight from each chat's own Agent blocks before the
-  # roster is computed, so they count toward the same rollups and ordering as
-  # trace-derived ones rather than arriving as a second-class list.
-  if chat_helpers:
-    _merge_chat_helpers(chats, attribution, chat_helpers, agents_out)
-
-  # The timeline is the chat view now, so every chat with recorded turns carries
-  # them on its doc. A chat that has turns always has helpers too (same walk), so
-  # its doc already exists; the fallback create keeps this independent of order.
-  if chat_turns:
-    for chat_id, turns in chat_turns.items():
-      if not turns:
+  for chat_id, helpers in (chat_helpers or {}).items():
+    provider = attribution.chats.get(chat_id, {}).get("provider") or providers.get(chat_id) or "claude"
+    providers[chat_id] = provider
+    for helper in helpers:
+      if not helper.get("agent_id"):
         continue
-      doc = chats.get(chat_id)
-      if doc is None:
-        doc = _empty_chat_doc(chat_id, attribution, {})
-        chats[chat_id] = doc
-      doc["turns"] = turns
+      item = _block_evidence(helper, provider)
+      evidence.setdefault(chat_id, {}).setdefault(item["agent_id"], []).append(item)
 
-  index = _build_index(chats, unlinked, agents_out, now)
-  return index, chats, agents_out
+  chats: dict[str, dict] = {}
+  helpers_out: dict[str, dict] = {}
+  used_helper_ids: dict[str, str] = {}
+  all_chat_ids = set(evidence) | set(chat_turns or {})
+  for chat_id in all_chat_ids:
+    if chat_id not in evidence or not evidence[chat_id]:
+      continue  # roster contains chats with background helpers, not tool-only chats
+    provider = providers.get(chat_id) or attribution.chats.get(chat_id, {}).get("provider") or "claude"
+    merged: dict[str, dict] = {}
+    for original_id, records in evidence[chat_id].items():
+      helper = _merge_evidence(records, provider)
+      public_id = original_id
+      if public_id in used_helper_ids and used_helper_ids[public_id] != chat_id:
+        suffix = hashlib.sha256(chat_id.encode()).hexdigest()[:6]
+        public_id = f"{original_id}-{suffix}"
+      used_helper_ids[public_id] = chat_id
+      helper["agent_id"] = public_id
+      merged[original_id] = helper
 
-
-def _empty_chat_doc(chat_id: str, attribution: Attribution, session: dict) -> dict:
-  meta = attribution.chats.get(chat_id, {})
-  return {
-    "schema": SCHEMA_VERSION, "chat_id": chat_id,
-    "title": meta.get("title") or "Untitled chat",
-    "provider": meta.get("provider") or session.get("provider") or "claude",
-    "runs": [],
-  }
-
-
-def _build_run(run: dict, chat_id: str, model: dict, now: float
-               ) -> tuple[dict, dict[tuple[str, str], dict]]:
-  agents_summary: list[dict] = []
-  agent_pages: dict[tuple[str, str], dict] = {}
-  earliest: Optional[str] = run.get("started_at")
-  latest_end: Optional[str] = None
-  has_usage = False
-  has_live = False
-  for akey in run["agent_keys"]:
-    agent = model["agents"].get(akey)
-    if not agent:
+    owner_turns = list((chat_turns or {}).get(chat_id, []))
+    referenced = {aid for turn in owner_turns for aid in turn.get("_agent_ids", [])}
+    raw_turns = owner_turns + [turn for turn in synthetic_turns.get(chat_id, [])
+                               if any(aid not in referenced for aid in turn.get("_agent_ids", []))]
+    stored_title = str(attribution.chats.get(chat_id, {}).get("title") or "Untitled chat")
+    turns = [_build_v2_turn(raw, merged, stored_title) for raw in raw_turns]
+    turns.sort(key=lambda turn: turn.get("ts") or "")
+    if not turns:
       continue
-    status = derive_status(agent, now)
-    has_usage = has_usage or agent.get("tokens", 0) > 0
-    has_live = has_live or status == "working"
-    duration = _duration_secs(agent.get("started_at"), agent.get("last_ts"))
-    steps, step_trunc = cap_steps([
-      {"kind": s.get("kind", "tool"),
-       "title": clip_line(s.get("title", ""), 80),
-       "detail": clip_line(s.get("detail", ""))}
-      for s in agent.get("steps", [])
-    ])
-    agents_summary.append({
-      "agent_id": agent["agent_id"],
-      "description": _card_label(agent),
-      "agent_type": agent.get("agent_type") or "unknown",
-      "status": status,
-      "reported_outcome": _reported_outcome(agent),
-      "started_at": agent.get("started_at"),
-      "duration_secs": duration,
-      "steps_count": len(agent.get("steps", [])) or None,
-      "tokens": agent.get("tokens") or None,
-      "has_activity": bool(agent.get("has_activity")),
-    })
-    agent_pages[(chat_id, agent["agent_id"])] = {
-      "schema": SCHEMA_VERSION,
-      "goal": clip_line(agent.get("goal", ""), 400),
-      "agent_type": agent.get("agent_type") or "unknown",
-      "steps": steps,
-      "final_report": _cap_report(agent.get("final_report", "")),
-      "truncated": bool(agent.get("truncated") or step_trunc),
-      "source_expired": bool(agent.get("source_expired")),
+
+    first_request = next((raw.get("_first_request") for raw in owner_turns
+                          if raw.get("_first_request")), "")
+    last_turn = turns[-1]
+    running_turns = [turn for turn in turns if turn["status"] == "running"]
+    summary_turn = running_turns[-1] if running_turns else last_turn
+    changed = any(turn["outcome"].startswith(("Updated ", "Built ")) for turn in turns)
+    title = (stored_title if not _title_is_raw(stored_title)
+             else _title_from_request(first_request, last_turn["area"], changed))
+    status, result = _chat_status(turns)
+    ts = max((turn["ts"] for turn in turns if turn.get("ts")), default=None)
+    doc = {
+      "schema": SCHEMA_VERSION, "chat_id": chat_id, "provider": provider,
+      "title": clip_line(title, 120), "outcome": summary_turn["outcome"],
+      "ts": ts, "turns": turns,
     }
-    if agent.get("started_at") and (earliest is None or agent["started_at"] < earliest):
-      earliest = agent["started_at"]
-    if status != "working" and agent.get("last_ts"):
-      if latest_end is None or agent["last_ts"] > latest_end:
-        latest_end = agent["last_ts"]
-  run_doc = {
-    "run_id": run["run_id"],
-    "kind": run["kind"],
-    # label is free text (a task-board subject or workflow meta.name), so scrub
-    # + cap it like every other emitted text field; the run_id fallback is a
-    # bare id and passes through clip_line unchanged.
-    "label": clip_line(run.get("label") or run["run_id"], 200),
-    "started_at": earliest,
-    "ended_at": None if has_live else latest_end,
-    "agents": agents_summary,
-    "capabilities": {
-      "has_saved_plan": bool(run.get("phases")),
-      "has_usage": has_usage,
-      "has_live_progress": has_live,
-    },
-  }
-  # phases render only for the workflow kind (frozen schema).
-  if run["kind"] == "workflow":
-    run_doc["phases"] = [
-      {"title": clip_line(p.get("title", ""), 120), "detail": clip_line(p.get("detail", ""))}
-      for p in run.get("phases", [])
-    ]
-  return run_doc, agent_pages
+    chats[chat_id] = doc
+    for helper in merged.values():
+      public_id = helper["agent_id"]
+      helpers_out[public_id] = {
+        "schema": SCHEMA_VERSION, "agent_id": public_id, "chat_id": chat_id,
+        "kind": helper["kind"], "name": helper["name"], "ask": helper["ask"],
+        "brief_full": helper["brief_full"], "state": helper["state"],
+        "did": helper["did"], "result": helper["result"],
+        "report_full": helper["report_full"], "next": helper["next"],
+        "commands": helper["commands"],
+      }
+
+  index = _build_index(chats, helpers_out, now)
+  return index, chats, helpers_out, unlinked
 
 
 def _cap_report(text: str) -> str:
@@ -1922,39 +2125,38 @@ def _cap_report(text: str) -> str:
   return out.encode("utf-8")[:FINAL_REPORT_CAP].decode("utf-8", "ignore") + "…"
 
 
-def _build_index(chats: dict[str, dict], unlinked: dict[str, dict],
-                 agents_out: dict, now: float) -> dict:
-  chat_rows = []
+def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: float) -> dict:
+  entries: list[dict] = []
+  needs_attention: list[dict] = []
+  task_counts: dict[str, int] = {}
+  for helper in helpers_out.values():
+    task_counts[helper["chat_id"]] = task_counts.get(helper["chat_id"], 0) + 1
   for chat_id, doc in chats.items():
-    helpers = {"finished": 0, "working": 0, "failed": 0, "stopped": 0}
-    tokens_total = 0
-    last_activity = None
-    for run in doc["runs"]:
-      for a in run["agents"]:
-        st = a["status"]
-        if st in helpers:
-          helpers[st] += 1
-        # "unavailable" helpers are omitted from the counts (missing data is
-        # never shown as a bucket), matching the product-truth rule.
-        if a.get("tokens"):
-          tokens_total += a["tokens"]
-        if a.get("started_at") and (last_activity is None or a["started_at"] > last_activity):
-          last_activity = a["started_at"]
-    chat_rows.append({
-      "chat_id": chat_id, "title": doc["title"], "provider": doc["provider"],
-      "runs": len(doc["runs"]), "helpers": helpers,
-      "last_activity_at": last_activity,
-      "tokens_total": tokens_total or None,
-    })
-  chat_rows.sort(key=lambda r: r.get("last_activity_at") or "", reverse=True)
-  unlinked_rows = sorted(unlinked.values(),
-                         key=lambda r: r.get("last_activity_at") or "", reverse=True)
-  return {
-    "schema": SCHEMA_VERSION,
-    "updated_at": _epoch_to_iso(now),
-    "chats": chat_rows,
-    "unlinked": unlinked_rows,
-  }
+    status, result = _chat_status(doc["turns"])
+    last_turn = doc["turns"][-1]
+    running_turns = [turn for turn in doc["turns"] if turn["status"] == "running"]
+    summary_turn = running_turns[-1] if running_turns else last_turn
+    row = {
+      "chat_id": chat_id, "provider": doc["provider"], "title": doc["title"],
+      "outcome": doc["outcome"], "area": summary_turn["area"], "result": result,
+      "status": status, "tasks": task_counts.get(chat_id, 0), "ts": doc.get("ts"),
+    }
+    entries.append(row)
+    if status != "done":
+      if status == "running":
+        reason = "running"
+      elif result == "not confirmed":
+        reason = "unverified"
+      else:
+        reason = "failed"
+      needs_attention.append({
+        "chat_id": chat_id, "title": doc["title"], "reason": reason,
+        "outcome": doc["outcome"], "area": summary_turn["area"], "ts": doc.get("ts"),
+      })
+  entries.sort(key=lambda row: row.get("ts") or "", reverse=True)
+  needs_attention.sort(key=lambda row: row.get("ts") or "", reverse=True)
+  return {"schema": SCHEMA_VERSION, "updated_at": _epoch_to_iso(now),
+          "needs_attention": needs_attention, "entries": entries}
 
 
 # --- storage sink -----------------------------------------------------------
@@ -2013,13 +2215,46 @@ class DictSink:
     self.writes.append(f"DELETE {rel_path}")
 
 
+class LocalSink:
+  """Local-only dry-run sink. It never calls the app storage API.
+
+  Paths are resolved under `root` and rejected if they would escape it. Deletes
+  apply only to files generated beneath that local root, so a dry run cannot
+  mutate production storage or its database.
+  """
+
+  def __init__(self, root: Path):
+    self.root = root.resolve()
+    self.root.mkdir(parents=True, exist_ok=True)
+    self.writes: list[str] = []
+
+  def _path(self, rel_path: str) -> Path:
+    path = (self.root / rel_path).resolve()
+    if self.root != path and self.root not in path.parents:
+      raise ValueError(f"output path escapes dry-run directory: {rel_path}")
+    return path
+
+  def put(self, rel_path: str, doc: dict) -> None:
+    path = self._path(rel_path)
+    save_json(path, doc)
+    self.writes.append(f"PUT {rel_path}")
+
+  def delete(self, rel_path: str) -> None:
+    path = self._path(rel_path)
+    try:
+      path.unlink()
+    except FileNotFoundError:
+      pass
+    self.writes.append(f"DELETE {rel_path}")
+
+
 def flush_documents(index: dict, chats: dict[str, dict],
-                    agents: dict[tuple[str, str], dict], sink: StorageSink,
+                    helpers: dict[str, dict], sink: StorageSink,
                     digests: dict[str, str]) -> list[str]:
-  """Writes only changed documents (content-hash gate) and evicts agent pages
+  """Writes only changed documents (content-hash gate) and evicts helper pages
   over the self-cap. Returns the ordered list of storage paths actually written
   so the caller can log/return exactly what happened."""
-  agent_paths = enforce_app_cap(index, chats, agents)
+  helper_ids = enforce_app_cap(index, chats, helpers)
   written: list[str] = []
 
   def _put(path: str, doc: dict) -> None:
@@ -2034,12 +2269,12 @@ def flush_documents(index: dict, chats: dict[str, dict],
   _put("index.json", index)
   for chat_id, doc in chats.items():
     _put(f"chats/{chat_id}.json", doc)
-  for (chat_id, agent_id) in agent_paths:
-    _put(f"agents/{chat_id}/{agent_id}.json", agents[(chat_id, agent_id)])
+  for agent_id in helper_ids:
+    _put(f"helpers/{agent_id}.json", helpers[agent_id])
 
   # A page that dropped below the cap this run (or lost its chat) is deleted so
   # the app never serves a stale detail page the roster no longer references.
-  live_paths = {f"agents/{c}/{a}.json" for (c, a) in agent_paths}
+  live_paths = {f"helpers/{agent_id}.json" for agent_id in helper_ids}
   live_paths.add("index.json")
   live_paths.update(f"chats/{c}.json" for c in chats)
   for stale in [p for p in digests if p not in live_paths]:
@@ -2050,21 +2285,23 @@ def flush_documents(index: dict, chats: dict[str, dict],
 
 
 def enforce_app_cap(index: dict, chats: dict[str, dict],
-                    agents: dict[tuple[str, str], dict]) -> list[tuple[str, str]]:
-  """Returns the agent-page keys to keep under `APP_ARTIFACT_CAP_BYTES`.
+                    helpers: dict[str, dict]) -> list[str]:
+  """Returns the helper ids to keep under `APP_ARTIFACT_CAP_BYTES`.
 
-  Roster (index) + chat summaries are never evicted — only agent detail pages,
+  Roster (index) + chat summaries are never evicted — only helper detail pages,
   oldest-chat-first (LRU by the chat's last activity), so the app keeps its
   navigable shape and only loses the deepest, oldest detail."""
-  activity: dict[str, str] = {r["chat_id"]: r.get("last_activity_at") or ""
-                              for r in index["chats"]}
-  keys = sorted(agents.keys(), key=lambda k: activity.get(k[0], ""), reverse=True)
+  activity: dict[str, str] = {r["chat_id"]: r.get("ts") or ""
+                              for r in index["entries"]}
+  keys = sorted(helpers.keys(),
+                key=lambda key: activity.get(helpers[key].get("chat_id"), ""),
+                reverse=True)
   base = len(json.dumps(index).encode()) + sum(
     len(json.dumps(d).encode()) for d in chats.values())
-  kept: list[tuple[str, str]] = []
+  kept: list[str] = []
   total = base
   for key in keys:
-    size = len(json.dumps(agents[key], ensure_ascii=False).encode("utf-8"))
+    size = len(json.dumps(helpers[key], ensure_ascii=False).encode("utf-8"))
     if total + size > APP_ARTIFACT_CAP_BYTES:
       continue
     kept.append(key)
@@ -2112,18 +2349,12 @@ def _iso_to_epoch(ts_iso: Optional[str]) -> Optional[float]:
   return None
 
 
-def _duration_secs(start: Optional[str], end: Optional[str]) -> Optional[int]:
-  s, e = _iso_to_epoch(start), _iso_to_epoch(end)
-  if s is None or e is None or e < s:
-    return None
-  return int(e - s)
-
-
 # --- top-level refresh ------------------------------------------------------
 
 def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
                 base_url: str, app_id: str, app_token: str,
-                service_token: str) -> dict:
+                service_token: str,
+                sink: Optional[StorageSink] = None) -> dict:
   """One budgeted refresh slice: parse deltas, attribute, write changed docs.
 
   Returns a summary dict (also the source of the one-line cron log). When the
@@ -2132,6 +2363,12 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   budget = Budget(BUDGET_SECS, BUDGET_BYTES)
   now = time.time()
   model = load_json(state_dir / "model.json", None) or _new_model()
+  migrating_v2 = model.get("schema") != SCHEMA_VERSION
+  # The trace accumulator is forward-compatible, but cached chat turns are not:
+  # v1 stored rail nodes/gists while v2 needs bounded raw tool evidence. Keep the
+  # expensive trace model, mark it migrated, and force only owner-chat blocks to
+  # be walked again below.
+  model["schema"] = SCHEMA_VERSION
   cursors = CursorStore(state_dir / "cursors.json")
   digests = load_json(state_dir / "digests.json", {})
   scanned = load_json(state_dir / "scanned-chats.json", {})
@@ -2143,6 +2380,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
 
   parse_claude(cc_dir, model, cursors, budget)
   parse_codex(codex_home, model, cursors, budget)
+  _enforce_parent_invariant(model)
   _mark_expired_sources(model, cc_dir, codex_home)
 
   # Owner-API inputs. A FETCH FAILURE (missing token, timeout, 5xx, malformed
@@ -2176,6 +2414,10 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   helper_scanned = load_json(state_dir / "scanned-chat-helpers.json", {})
   chat_helpers_state = load_json(state_dir / "chat-helpers.json", {})
   chat_turns_state = load_json(state_dir / "chat-turns.json", {})
+  if migrating_v2:
+    helper_scanned = {}
+    chat_helpers_state = {}
+    chat_turns_state = {}
   new_helpers, new_turns, rescanned = scan_chat_helpers(
     base_url, service_token, chats_meta, helper_scanned, budget)
   chat_helpers_state.update(new_helpers)
@@ -2192,12 +2434,12 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
       chat_turns_state.pop(cid, None)
 
   attribution = Attribution(links, tooluse_map, chats_meta)
-  index, chats, agents = build_documents(
+  index, chats, helpers, unlinked = build_documents(
     model, attribution, now, chat_helpers=chat_helpers_state,
     chat_turns=chat_turns_state)
 
-  sink: StorageSink = HttpSink(base_url, app_id, app_token)
-  written = flush_documents(index, chats, agents, sink, digests)
+  output_sink: StorageSink = sink or HttpSink(base_url, app_id, app_token)
+  written = flush_documents(index, chats, helpers, output_sink, digests)
 
   save_json(state_dir / "model.json", model)
   cursors.save()
@@ -2209,9 +2451,9 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   save_json(state_dir / "chat-turns.json", chat_turns_state)
 
   return {
-    "chats": len(index["chats"]),
-    "unlinked": len(index["unlinked"]),
-    "agents": len(agents),
+    "chats": len(index["entries"]),
+    "unlinked": len(unlinked),
+    "agents": len(helpers),
     "writes": len(written),
     "bytes_parsed": budget.bytes_read,
     "budget_exhausted": budget.exhausted,
@@ -2356,6 +2598,7 @@ def selftest() -> int:
     cursors = CursorStore(state / "cursors.json")
     parse_claude(cc, model, cursors, budget)
     parse_codex(codex, model, cursors, budget)
+    _enforce_parent_invariant(model)
     _mark_expired_sources(model, cc, codex)
 
     # Attribution fixtures: session-links covers the Claude session; the Codex
@@ -2366,56 +2609,56 @@ def selftest() -> int:
     chats_meta = {"chatA": {"title": "Fix flaky test", "provider": "claude"},
                   "chatC": {"title": "Refactor parser", "provider": "codex"}}
     attribution = Attribution(links, {"toolu_TASKA": "chatA"}, chats_meta)
-    index, chats, agents = build_documents(model, attribution, now)
+    index, chats, helpers, unlinked = build_documents(model, attribution, now)
 
     sink = DictSink()
-    written = flush_documents(index, chats, agents, sink, {})
+    written = flush_documents(index, chats, helpers, sink, {})
 
     # --- schema-shape asserts (json-schema-ish) ---
     _assert(index["schema"] == SCHEMA_VERSION, "index schema")
     _assert(isinstance(index["updated_at"], str), "index.updated_at is ISO")
-    _assert(len(index["chats"]) == 2, f"expected 2 chats, got {len(index['chats'])}")
-    for row in index["chats"]:
-      _assert(set(row) == {"chat_id", "title", "provider", "runs", "helpers",
-                           "last_activity_at", "tokens_total"}, f"index chat keys: {set(row)}")
-      _assert(set(row["helpers"]) == {"finished", "working", "failed", "stopped"},
-              "helpers buckets")
+    _assert(set(index) == {"schema", "updated_at", "needs_attention", "entries"},
+            f"index keys: {set(index)}")
+    _assert(len(index["entries"]) == 2,
+            f"expected 2 chats, got {len(index['entries'])}")
+    for row in index["entries"]:
+      _assert(set(row) == {"chat_id", "provider", "title", "outcome", "area",
+                           "result", "status", "tasks", "ts"},
+              f"index entry keys: {set(row)}")
 
     doc_a = chats["chatA"]
     _assert(doc_a["provider"] == "claude", "chatA provider")
-    kinds = {r["kind"] for r in doc_a["runs"]}
-    _assert("workflow" in kinds and "tasks" in kinds, f"chatA run kinds: {kinds}")
-    wf_run = next(r for r in doc_a["runs"] if r["kind"] == "workflow")
-    _assert("phases" in wf_run and len(wf_run["phases"]) == 2, "workflow phases present")
-    _assert(wf_run["capabilities"]["has_saved_plan"] is True, "has_saved_plan")
-    tasks_run = next(r for r in doc_a["runs"] if r["kind"] == "tasks")
-    _assert("phases" not in tasks_run, "tasks run has no phases key")
-    _assert(tasks_run["label"] == "Interview flaky test", "task board labelled the run")
-    a0 = tasks_run["agents"][0]
-    _assert(set(a0) == {"agent_id", "description", "agent_type", "status",
-                        "reported_outcome", "started_at", "duration_secs",
-                        "steps_count", "tokens", "has_activity"}, f"agent summary keys: {set(a0)}")
-    _assert(a0["status"] == "finished", f"task agent finished, got {a0['status']}")
+    _assert(set(doc_a) == {"schema", "chat_id", "provider", "title", "outcome",
+                           "ts", "turns"}, f"chat keys: {set(doc_a)}")
+    _assert(doc_a["turns"], "chat has derived turns")
+    for turn in doc_a["turns"]:
+      _assert(set(turn) == {"outcome", "area", "result", "status", "flag", "ts",
+                            "subs", "original", "commands", "nblocks"},
+              f"turn keys: {set(turn)}")
+      for sub in turn["subs"]:
+        _assert(set(sub) == {"agent_id", "kind", "name", "ask", "state", "acts",
+                             "result", "brief_full", "tappable"},
+                f"sub keys: {set(sub)}")
 
     doc_c = chats["chatC"]
     _assert(doc_c["provider"] == "codex", "chatC provider")
-    collab = next(r for r in doc_c["runs"] if r["kind"] == "collab")
-    _assert(any(a["status"] == "finished" for a in collab["agents"]), "collab agent finished")
+    _assert(any(sub["state"] == "done" for turn in doc_c["turns"]
+                for sub in turn["subs"]), "collab helper done")
 
     # --- product-truth asserts ---
-    page = sink.docs["agents/chatA/wfB.json"]
-    _assert(set(page) == {"schema", "goal", "agent_type", "steps",
-                          "final_report", "truncated", "source_expired"},
-            f"agent page keys: {set(page)}")
-    for step in page["steps"]:
-      _assert(set(step) == {"kind", "title", "detail"}, f"step keys: {set(step)}")
+    page = sink.docs["helpers/wfB.json"]
+    _assert(set(page) == {"schema", "agent_id", "chat_id", "kind", "name", "ask",
+                          "brief_full", "state", "did", "result", "report_full",
+                          "next", "commands"}, f"helper page keys: {set(page)}")
+    for step in page["did"]:
+      _assert(set(step) == {"verb", "label", "count"}, f"did keys: {set(step)}")
     # secret scrubbing reached the task agent's final report/outcome.
-    task_page = sink.docs["agents/chatA/taskA.json"]
-    _assert("sk-ant-SECRET" not in json.dumps(task_page), "secret scrubbed from agent page")
+    task_page = sink.docs["helpers/taskA.json"]
+    _assert("sk-ant-SECRET" not in json.dumps(task_page), "secret scrubbed from helper page")
     _assert("sk-ant-SECRET" not in json.dumps(index), "secret scrubbed from index")
 
     # child inherited the parent's chat via parent_thread_id.
-    child_agent_ids = {a["agent_id"] for r in doc_c["runs"] for a in r["agents"]}
+    child_agent_ids = {sub["agent_id"] for turn in doc_c["turns"] for sub in turn["subs"]}
     _assert("019f0000-child0" in child_agent_ids, "codex child linked to parent chat")
 
     # === finding-specific asserts =========================================
@@ -2429,13 +2672,11 @@ def selftest() -> int:
     _assert("[redacted-jwt]" in scrub("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123456"),
             "JWT still redacted after divergence")
 
-    # #7: run label is scrubbed + capped at emit.
-    lm = _new_model()
-    lr = _run(lm, "sL", "rL", "tasks", "subj abcdefABCDEF0123456789abcdefABCDEF01")
-    la = _agent(lm, "sL", "rL", "aL", "tasks"); la["has_activity"] = True
-    lrun_doc, _ = _build_run(lr, "chatL", lm, now)
-    _assert("[redacted-token]" in lrun_doc["label"] and "abcdefABCDEF0123" not in lrun_doc["label"],
-            f"run label scrubbed at emit: {lrun_doc['label']!r}")
+    # Free-text title derivation is scrubbed and ends on a word boundary.
+    derived_title = _title_from_request(
+      "please update abcdefABCDEF0123456789abcdefABCDEF01 safely", "Notes", True)
+    _assert("[redacted-token]" in derived_title and "abcdefABCDEF0123" not in derived_title,
+            f"derived title scrubbed: {derived_title!r}")
 
     # #2: (provider, sid) keying — a codex link on the SAME id must not shadow
     # the claude session's own-provider link.
@@ -2449,6 +2690,108 @@ def selftest() -> int:
            "B": {"provider": "codex", "parent_thread_id": "A"}}
     ccid, creason = Attribution({}, {}, {}).resolve("A", cyc)
     _assert(ccid is None and creason == "parent-cycle", f"parent cycle reason: {creason}")
+
+    # A fresh session_meta clears stale parent state, and a self-parent is always
+    # normalized to no parent rather than becoming a fake helper/cycle.
+    parent_root = root / "parent-invariant" / "sessions" / "2026" / "07" / "17"
+    pinv = _new_model()
+    _session(pinv, "fresh-top", "codex")["parent_thread_id"] = "stale-parent"
+    _write(parent_root / "rollout-fresh-top.jsonl", json.dumps({
+      "timestamp": "2026-07-17T00:00:00Z", "type": "session_meta",
+      "payload": {"id": "fresh-top", "session_id": "fresh-top"}}) + "\n")
+    _write(parent_root / "rollout-self-parent.jsonl", json.dumps({
+      "timestamp": "2026-07-17T00:00:00Z", "type": "session_meta",
+      "payload": {"id": "self-parent", "session_id": "self-parent",
+                  "parent_thread_id": "self-parent"}}) + "\n")
+    parse_codex(root / "parent-invariant", pinv, CursorStore(root / "pinv-cur.json"),
+                Budget(BUDGET_SECS, BUDGET_BYTES))
+    _assert(pinv["sessions"]["fresh-top"]["parent_thread_id"] is None,
+            "fresh top-level metadata clears stale parent")
+    _assert(pinv["sessions"]["self-parent"]["parent_thread_id"] is None,
+            "session is never its own parent")
+    _session(pinv, "legacy-self", "codex")["parent_thread_id"] = "legacy-self"
+    _agent(pinv, "legacy-self", "collab", "legacy-self", "collab")
+    _enforce_parent_invariant(pinv)
+    _assert(pinv["sessions"]["legacy-self"]["parent_thread_id"] is None
+            and "legacy-self::legacy-self" not in pinv["agents"],
+            "stale self-parent helper removed from accumulator")
+
+    # Terminal downstream evidence supersedes a superficial async launch ack.
+    ack = helper_from_agent_block({
+      "type": "tool", "tool": "Agent", "status": "done",
+      "input": "{'description': 'Check parser', 'subagent_type': 'Explore'}",
+      "output": "Async agent launched successfully\nagentId: joined"}, scope="chatJ")
+    block_ev = _block_evidence(ack, "claude")
+    trace_ev = dict(block_ev, state="done", origin="trace",
+                    report_full="Done. Parser check completed.")
+    joined = _merge_evidence([block_ev, trace_ev], "claude")
+    _assert(joined["state"] == "done", f"terminal evidence wins: {joined['state']}")
+    joined_turn = _build_v2_turn({
+      "_agent_ids": ["joined"], "_tools": [], "_original": "Done.",
+      "ts": 1_700_000_000_000, "nblocks": 1}, {"joined": joined})
+    _assert(joined_turn["subs"][0]["state"] == "done",
+            "turn and helper use the joined state")
+
+    # Production-shaped Beat Machine validator regression: the recorded check
+    # says valid=false, so a later "should work" claim cannot become green.
+    beat_messages = [
+      {"role": "user", "content": "Please update Beat Machine", "ts": 1775497394976},
+      {"role": "assistant", "blocks": [
+        {"type": "tool", "tool": "Agent", "status": "done", "input":
+         "{'subagent_type': 'Explore', 'description': 'Find app build process'}", "output": ""},
+        {"type": "tool", "tool": "Bash", "status": "done", "input":
+         "curl -X PATCH $API_BASE_URL/api/apps/10", "output": "10"},
+        {"type": "tool", "tool": "Bash", "status": "done", "input":
+         "curl $API_BASE_URL/api/apps/10/validate", "output":
+         '{"valid": false, "issues": ["Compiled JS has no default export — the component won\'t mount."]}'},
+        {"type": "text", "content":
+         "The validator checks for export default OR export{. The app should work and has been updated."},
+      ]},
+    ]
+    beat_helpers, beat_raw_turns = _walk_chat(beat_messages, scope="beat-chat")
+    beat_merged = {h["agent_id"]: _merge_evidence([_block_evidence(h, "claude")], "claude")
+                   for h in beat_helpers}
+    beat_turn = _build_v2_turn(beat_raw_turns[0], beat_merged)
+    _assert(beat_turn["status"] == "attention" and beat_turn["result"] == "not confirmed",
+            f"Beat validator truth gate: {beat_turn}")
+    _assert(beat_turn["outcome"] == "Investigated Beat Machine",
+            f"Beat validator neutral outcome: {beat_turn['outcome']}")
+    _assert(beat_turn["original"].startswith("The validator checks for export default OR export{"),
+            "Beat validator original preserved")
+
+    # Missing verification is the normal case: a plain reported edit stays
+    # done, while positive doubt in the agent's own words remains amber.
+    ordinary_raw = {
+      "_agent_ids": [], "_tools": [{
+        "tool": "Edit", "input": "/data/apps/beat-machine/src/App.jsx",
+        "output": "", "status": "done"}],
+      "_original": "Updated Beat Machine with the requested controls.",
+      "ts": 1_700_000_000_000, "nblocks": 1,
+    }
+    ordinary_turn = _build_v2_turn(ordinary_raw, {})
+    _assert(ordinary_turn["status"] == "done" and ordinary_turn["result"] == "done",
+            f"untested ordinary edit stays done: {ordinary_turn}")
+    hedged_raw = dict(
+      ordinary_raw,
+      _original="Updated Beat Machine. It should load fine.")
+    hedged_turn = _build_v2_turn(hedged_raw, {})
+    _assert(hedged_turn["status"] == "attention"
+            and hedged_turn["result"] == "not confirmed",
+            f"agent hedge stays attention: {hedged_turn}")
+    _assert(not _hedges_result(
+      "The attempted resolver errored, so I replaced it with a deterministic path."),
+      "historical attempt is not a hedge on the delivered result")
+    _assert(not _hedges_result(
+      "MutationObserver catches changes that ResizeObserver might miss."),
+      "old failure-mode explanation is not a hedge on the delivered result")
+    _assert(_request_noun(
+      "building Mustafina Garaža — a 2030-aesthetic garage site in Bosnian")
+      == "Mustafina Garaža", "named new-site request supplies area fallback")
+    _assert(_request_noun("build a period tracking app") is None,
+            "generic build request does not invent a product name")
+    _assert(_delivery_sentence("Here's what's making headlines right now:")
+            == "Here's what's making headlines right now",
+            "selected delivery lead drops trailing colon")
 
     # #1: a fetch FAILURE (here: no service token) is distinguished from empty
     # success, so fetch_* report ok=False and run_refresh aborts without writing.
@@ -2531,10 +2874,10 @@ def selftest() -> int:
             "board failure cleared once no card is failing")
 
     print("SELFTEST OK")
-    print(f"  chats={len(index['chats'])} unlinked={len(index['unlinked'])} "
-          f"agents={len(agents)} writes={len(written)}")
-    print(f"  run kinds chatA={sorted(kinds)} chatC={sorted({r['kind'] for r in doc_c['runs']})}")
-    print(f"  scrubbed final_report(taskA)={task_page['final_report']!r}")
+    print(f"  chats={len(index['entries'])} unlinked={len(unlinked)} "
+          f"helpers={len(helpers)} writes={len(written)}")
+    print(f"  helper kinds={sorted({page['kind'] for page in helpers.values()})}")
+    print(f"  scrubbed report_full(taskA)={task_page['report_full']!r}")
     return 0
 
 
@@ -2545,6 +2888,10 @@ def main(argv: Optional[list[str]] = None) -> int:
   parser.add_argument("--selftest", action="store_true",
                       help="run the offline fixture self-test and exit")
   parser.add_argument("--app-id", default=os.environ.get("APP_ID", ""))
+  parser.add_argument("--dry-run", action="store_true",
+                      help="write documents locally; never call app storage")
+  parser.add_argument("--out", type=Path,
+                      help="local output directory (required with --dry-run)")
   args = parser.parse_args(argv)
 
   if args.selftest:
@@ -2556,7 +2903,13 @@ def main(argv: Optional[list[str]] = None) -> int:
   app_id = args.app_id or os.environ.get("APP_ID", "")
   cc_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(data_dir / "cli-auth" / "claude")))
   codex_home = Path(os.environ.get("CODEX_HOME", str(data_dir / "cli-auth" / "codex")))
-  state_dir = Path(os.environ.get("WORKFLOWS_STATE_DIR", str(data_dir / "apps" / "workflows" / "state")))
+  if args.dry_run and args.out is None:
+    parser.error("--dry-run requires --out <local-directory>")
+  if args.out is not None and not args.dry_run:
+    parser.error("--out is only valid with --dry-run")
+  state_dir = ((args.out / ".state") if args.dry_run else
+               Path(os.environ.get("WORKFLOWS_STATE_DIR",
+                                   str(data_dir / "apps" / "workflows" / "state"))))
   # Owner reads use the service token (owner JWT); app routes reject it and the
   # app token, symmetrically. The service token is read from disk (the job env
   # deliberately excludes it), following the Reflection precedent.
@@ -2567,13 +2920,14 @@ def main(argv: Optional[list[str]] = None) -> int:
   except OSError:
     pass
 
-  if not app_token or not app_id:
+  if not args.dry_run and (not app_token or not app_id):
     print("workflows-refresh: missing APP_TOKEN/APP_ID; cannot write storage", file=sys.stderr)
     return 2
 
   state_dir.mkdir(parents=True, exist_ok=True)
+  output_sink = LocalSink(args.out) if args.dry_run else None
   summary = run_refresh(cc_dir, codex_home, state_dir, base_url, app_id,
-                        app_token, service_token)
+                        app_token, service_token, sink=output_sink)
   if summary.get("degraded"):
     # Owner-API inputs were unavailable: nothing was published or deleted, the
     # last-good documents are intact. Exit 4 (distinct from the shell wrapper's
@@ -2584,7 +2938,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"workflows-refresh: skipped-degraded ({summary['degraded_reason']}) "
           f"parsed={summary['bytes_parsed']}b writes=0")
     return 4
-  print(f"workflows-refresh: chats={summary['chats']} unlinked={summary['unlinked']} "
+  mode = "dry-run " if args.dry_run else ""
+  print(f"workflows-refresh: {mode}chats={summary['chats']} unlinked={summary['unlinked']} "
         f"agents={summary['agents']} writes={summary['writes']} "
         f"parsed={summary['bytes_parsed']}b exhausted={summary['budget_exhausted']}")
   return 0
