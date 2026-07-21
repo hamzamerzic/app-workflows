@@ -3,54 +3,14 @@
 // as markdown-lite. When the underlying activity has aged out we say so
 // plainly rather than showing a hollow view, and a truncated record is flagged.
 
-import React, { useState, useEffect, useMemo } from 'react'
-import { parseMarkdownLite } from '../domain.js'
+import React, { useState, useEffect } from 'react'
+import { Markdown } from './Markdown.jsx'
 
 function shortTitle(text, max = 52) {
   const s = (typeof text === 'string' ? text : '').trim()
   if (!s) return 'Helper'
   if (s.length <= max) return s
   return `${s.slice(0, max - 1).trimEnd()}…`
-}
-
-function ReportBlocks({ blocks }) {
-  const rendered = []
-  let i = 0
-  while (i < blocks.length) {
-    const block = blocks[i]
-    if (block.type === 'bullet') {
-      const items = []
-      while (i < blocks.length && blocks[i].type === 'bullet') {
-        items.push(blocks[i])
-        i += 1
-      }
-      rendered.push(
-        <ul className="wf-report-list" key={`ul-${i}`}>
-          {items.map((it, k) => (
-            <li className="wf-report-li" key={k}><Spans spans={it.spans} /></li>
-          ))}
-        </ul>,
-      )
-    } else {
-      rendered.push(
-        <p className="wf-report-p" key={`p-${i}`}><Spans spans={block.spans} /></p>,
-      )
-      i += 1
-    }
-  }
-  return <>{rendered}</>
-}
-
-function Spans({ spans }) {
-  return (
-    <>
-      {spans.map((span, k) => {
-        if (span.t === 'bold') return <strong key={k}>{span.v}</strong>
-        if (span.t === 'code') return <code className="wf-code" key={k}>{span.v}</code>
-        return <React.Fragment key={k}>{span.v}</React.Fragment>
-      })}
-    </>
-  )
 }
 
 export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
@@ -66,7 +26,6 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
   const goal = (rec && rec.goal) || (agentMeta && agentMeta.description) || 'Background helper'
   const steps = (rec && Array.isArray(rec.steps)) ? rec.steps : []
   const report = (rec && typeof rec.final_report === 'string') ? rec.final_report.trim() : ''
-  const blocks = useMemo(() => parseMarkdownLite(report), [report])
   const handback = (rec && rec.handback) || {}
   const handbackActions = Array.isArray(handback.actions) ? handback.actions : []
 
@@ -148,7 +107,7 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
                 <h2 className="wf-section-label">Report</h2>
               </div>
               <div className="wf-report">
-                <ReportBlocks blocks={blocks} />
+                <Markdown text={report} />
               </div>
             </>
           )}
@@ -162,7 +121,7 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
               <div className="wf-section-head">
                 <h2 className="wf-section-label">What happened next</h2>
               </div>
-              {handback.note && <p className="wf-handback-note">{handback.note}</p>}
+              {handback.note && <div className="wf-handback-note"><Markdown text={handback.note} /></div>}
               {handbackActions.length > 0 && (
                 <div className="wf-steps">
                   {handbackActions.map((action, i) => (

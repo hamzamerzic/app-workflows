@@ -1362,6 +1362,34 @@ def _branch_state(helper: dict) -> str:
   return "returned"
 
 
+# A spawn prompt / brief can be long; cap it generously enough to be a real
+# preview (multi-paragraph) but bounded so a chat doc full of subagents can't
+# bloat. Scrubbed like every other free-text field; "…" marks a cut.
+PROMPT_CAP = 700
+
+
+def clip_prompt(text: Optional[str]) -> Optional[str]:
+  if not text:
+    return None
+  out = scrub(text).strip()
+  if not out:
+    return None
+  return out[:PROMPT_CAP - 1] + "…" if len(out) > PROMPT_CAP else out
+
+
+def clip_markdown(text: Optional[str], cap: int) -> Optional[str]:
+  """Scrub + cap a free-text field but KEEP newlines, so the renderer can see
+  markdown structure (bullets, paragraphs). `clip_line` flattens newlines to
+  spaces and would collapse a list into one run-on line — wrong for anything
+  rendered as markdown (gist, notes)."""
+  if not text:
+    return None
+  out = scrub(str(text)).strip()
+  if not out:
+    return None
+  return out[:cap - 1] + "…" if len(out) > cap else out
+
+
 def _seg_node(run_blocks: list) -> dict:
   """Condense a maximal run of consecutive non-spawn tool blocks into one node:
   a tool tally (by descending count) and up to three short input samples, so a
@@ -1415,17 +1443,19 @@ def _walk_chat(messages: list) -> tuple[list[dict], list[dict]]:
     nodes: list[dict] = []
     run: list[dict] = []
     note_idx: list[int] = []
+    note_texts: list[str] = []
     nspawn = 0
     for index, block in enumerate(blocks):
       if not isinstance(block, dict):
         continue
       btype = block.get("type")
       if btype == "text":
-        text = clip_line(scrub(str(block.get("content") or "")).strip(), 240)
+        text = clip_markdown(block.get("content"), 300)
         if not text:
           continue
         run = _flush_seg(nodes, run)
         note_idx.append(len(nodes))
+        note_texts.append(text)
         nodes.append({"t": "note", "role": "post", "text": text})
       elif btype == "tool":
         if block.get("tool") in SPAWNING_TOOL_NAMES:
@@ -1443,12 +1473,19 @@ def _walk_chat(messages: list) -> tuple[list[dict], list[dict]]:
           nodes.append({
             "t": "branch",
             "state": _branch_state(record),
-            "desc": record.get("description") or "Background helper",
-            # null (not a placeholder) when unrecorded — the view omits the chip
-            # rather than assert a type/model we don't have.
+            # null (not an invented placeholder) when unrecorded; the UI shows a
+            # static "Helper" label rather than assert a description we lack.
+            "desc": record.get("description"),
+            # null when unrecorded — the view omits the chip rather than assert a
+            # type/model we don't have.
             "agent": record.get("agent_type"),
             "model": clip_line(_agent_field(raw_in, "model"), 48) or None,
             "async": bool(record.get("is_async")),
+            # The recorded PREVIEW of the brief the spawn was given — NOT the
+            # helper's runtime system prompt, and often clipped at the API's
+            # ~200-char tool-input ceiling. Labelled "Instructions" in the UI and
+            # never presented as complete. Scrubbed like every other field.
+            "prompt_excerpt": clip_prompt(_agent_field(raw_in, "prompt")),
             # Whether tapping the branch opens a detail page — the SAME gate the
             # agent page is written under, so a branch never navigates to an
             # empty view (no dead-end taps).
@@ -1463,11 +1500,17 @@ def _walk_chat(messages: list) -> tuple[list[dict], list[dict]]:
     if note_idx:
       nodes[note_idx[0]]["role"] = "pre"
       nodes[note_idx[-1]]["role"] = "final"
+    # The high-level gist is the turn's own closing note (its outcome), captured
+    # BEFORE node truncation so a long turn whose final note falls past the node
+    # cap still shows it; the opening note is the fallback. Never a generated
+    # summary — always the agent's own recorded words.
+    gist = note_texts[-1] if note_texts else None
     capped, truncated = _cap_turn_nodes(nodes)
     turns.append({
       "ts": msg.get("ts") if isinstance(msg.get("ts"), int) else None,
       "nspawn": nspawn,
       "nblocks": len(blocks),
+      "gist": gist,
       "nodes": capped,
       "truncated": truncated,
     })

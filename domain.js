@@ -184,6 +184,8 @@ export function parseMarkdownLite(text) {
   const lines = src.replace(/\r\n/g, '\n').split('\n')
   const blocks = []
   let para = []
+  let inCode = false
+  let code = []
   const flush = () => {
     if (para.length) {
       blocks.push({ type: 'para', spans: parseInline(para.join(' ')) })
@@ -192,18 +194,24 @@ export function parseMarkdownLite(text) {
   }
   for (const raw of lines) {
     const line = raw.trimEnd()
-    if (!line.trim()) {
-      flush()
+    // Fenced code block — verbatim, no inline parsing inside.
+    const fence = line.match(/^\s*```/)
+    if (fence) {
+      if (inCode) { blocks.push({ type: 'code', text: code.join('\n') }); code = []; inCode = false }
+      else { flush(); inCode = true }
       continue
     }
+    if (inCode) { code.push(raw); continue }
+    if (!line.trim()) { flush(); continue }
+    const heading = line.match(/^(#{1,3})\s+(.*)$/)
+    if (heading) { flush(); blocks.push({ type: 'heading', level: heading[1].length, spans: parseInline(heading[2]) }); continue }
     const bullet = line.match(/^\s*[-*]\s+(.*)$/)
-    if (bullet) {
-      flush()
-      blocks.push({ type: 'bullet', spans: parseInline(bullet[1]) })
-    } else {
-      para.push(line.trim())
-    }
+    if (bullet) { flush(); blocks.push({ type: 'bullet', spans: parseInline(bullet[1]) }); continue }
+    const num = line.match(/^\s*(\d{1,3})[.)]\s+(.*)$/)
+    if (num) { flush(); blocks.push({ type: 'num', n: num[1], spans: parseInline(num[2]) }); continue }
+    para.push(line.trim())
   }
+  if (inCode && code.length) blocks.push({ type: 'code', text: code.join('\n') })
   flush()
   return blocks
 }

@@ -53,6 +53,10 @@ export default function App({ appId, token }) {
 
   const chatNavRef = useRef(null)
   const helperNavRef = useRef(null)
+  // Per-chat view state (scroll position + open disclosures), keyed by chatId.
+  // Lives here so it outlives ChatDetail's unmount when a helper is opened, so
+  // returning lands on the same scroll position with the same rows expanded.
+  const chatViewStates = useRef(new Map())
   const autoRefreshedRef = useRef(false)
   const readyRef = useRef(false)
   const pollTimerRef = useRef(null)
@@ -228,6 +232,7 @@ export default function App({ appId, token }) {
         storage={storage}
         chatId={chat.chatId}
         chatMeta={chat.meta}
+        viewStates={chatViewStates.current}
         onBack={closeChat}
         onOpenHelper={openHelper}
         onOpenChat={openShellChat}

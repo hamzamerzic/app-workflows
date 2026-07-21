@@ -1,8 +1,11 @@
 {
   "id": "workflows",
   "name": "Workflows",
-  "version": "0.1.0",
-  "description": "See the background helpers your chats spin up — what they are doing, whether they finished, and what they reported back.",
+  "version": "1.0.0",
+  "description": "A git-graph timeline of your chats — see the subagents each turn spawned, whether they merged back, are still out, or failed, with the agent's own words and the brief each was given.",
+  "author": "mobius-os",
+  "license": "MIT",
+  "homepage": "https://github.com/mobius-os/app-workflows",
   "entry": "index.jsx",
   "icon": "icon.png",
   "source_files": [
@@ -13,8 +16,16 @@
     "views/ChatDetail.jsx",
     "views/HelperDetail.jsx",
     "views/Timeline.jsx",
+    "views/Markdown.jsx",
     "parse_runs.py"
   ],
+  "runtime": {
+    "imports": [
+      "react",
+      "react-dom"
+    ],
+    "esm_deps": []
+  },
   "schedule": {
     "default": "17 4 * * *",
     "user_configurable": true,
