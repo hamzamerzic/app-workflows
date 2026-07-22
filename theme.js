@@ -31,11 +31,6 @@ export const CSS = `
   0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-run) 34%, transparent); }
   50% { box-shadow: 0 0 0 3px transparent; }
 }
-@keyframes wf-rise {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
 .wf-sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
@@ -49,7 +44,8 @@ export const CSS = `
   --wf-s2: color-mix(in srgb, var(--text) 4%, var(--surface));
   --wf-s3: color-mix(in srgb, var(--text) 8%, var(--surface));
   --wf-line2: color-mix(in srgb, var(--text) 16%, var(--border));
-  --wf-faint: color-mix(in srgb, var(--muted) 62%, transparent);
+  --wf-faint: var(--muted);
+  --wf-link: color-mix(in srgb, var(--accent) 35%, var(--text));
   --wf-accent-soft: color-mix(in srgb, var(--accent) 15%, transparent);
   --wf-done: var(--green, #3f9a5a);
   --wf-done-soft: color-mix(in srgb, var(--green, #3f9a5a) 15%, transparent);
@@ -70,12 +66,8 @@ export const CSS = `
   word-break: break-word; overflow-wrap: anywhere;
 }
 .wf-scroll > * { flex-shrink: 0; }
+.wf-content { width: 100%; max-width: 760px; margin-inline: auto; }
 /* /mobius-ui:AppShell */
-
-/* mobius-ui:Scrollskin — app-owned; a future-library candidate (no sync owed). */
-.wf-scroll::-webkit-scrollbar { width: 0; height: 0; }
-.wf-scroll { scrollbar-width: none; }
-/* /mobius-ui:Scrollskin */
 
 /* mobius-ui:Header — app-owned; a future-library candidate (no sync owed).
    The flex shell already pins this above the scroll, so no sticky is needed. */
@@ -89,7 +81,7 @@ export const CSS = `
 .wf-mark {
   flex: 0 0 auto; width: 30px; height: 30px; border-radius: 9px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 15px; font-weight: 800; letter-spacing: -0.03em; color: #3a2704;
+  font-size: 15px; font-weight: 800; letter-spacing: -0.03em; color: #2b1b00;
   background: linear-gradient(150deg, #f3d488, #b5811f);
   box-shadow: inset 0 1px 1px rgba(255,255,255,.5), 0 1px 2px rgba(120,80,0,.3);
 }
@@ -114,11 +106,11 @@ export const CSS = `
 /* A text back-link — "‹ Activity" / "‹ Back". */
 .wf-back-text {
   flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px;
-  min-height: 40px; padding: 4px 8px 4px 2px; margin-left: -2px;
-  appearance: none; border: 0; background: none; color: var(--accent);
+  min-height: 44px; padding: 6px 10px 6px 2px; margin-left: -2px;
+  appearance: none; border: 0; background: none; color: var(--wf-link);
   font: inherit; font-size: 15px; cursor: pointer; border-radius: 8px;
 }
-.wf-back-text:hover { color: var(--accent); text-decoration: underline; }
+.wf-back-text:hover { color: var(--text); text-decoration: underline; }
 .wf-spacer { flex: 1 1 auto; }
 
 /* mobius-ui:Button — app-owned; a future-library candidate (no sync owed). */
@@ -135,7 +127,7 @@ export const CSS = `
 /* /mobius-ui:Button */
 
 .wf-icon-btn {
-  flex: 0 0 auto; width: 40px; height: 40px; display: inline-flex;
+  flex: 0 0 auto; width: 44px; height: 44px; display: inline-flex;
   align-items: center; justify-content: center; border-radius: 10px;
   border: 0; background: none; color: var(--muted);
   font-size: 18px; line-height: 1; cursor: pointer;
@@ -163,31 +155,30 @@ export const CSS = `
 .wf-needs-ic {
   flex: 0 0 auto; width: 24px; height: 24px; border-radius: 7px;
   display: grid; place-items: center; font-size: 13px; font-weight: 700;
-  background: var(--wf-attn); color: #fff;
+  background: var(--wf-attn); color: #2b1b00;
 }
-.wf-needs.is-clear .wf-needs-ic { background: var(--wf-done-soft); color: var(--wf-done); }
+.wf-needs.is-clear .wf-needs-ic { background: var(--wf-done-soft); color: var(--text); }
 .wf-needs-tx { display: flex; flex-direction: column; min-width: 0; }
 .wf-needs-head { font-size: 13px; font-weight: 600; color: var(--text); }
 .wf-needs-sub {
   font-size: 11.5px; color: var(--muted); font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62vw;
 }
-.wf-needs-go { margin-left: auto; color: var(--wf-attn); font-size: 16px; flex: 0 0 auto; }
+.wf-needs-go { margin-left: auto; color: var(--text); font-size: 16px; flex: 0 0 auto; }
 
 .wf-daylabel {
-  font-size: 12px; font-weight: 700; color: var(--wf-faint);
-  letter-spacing: 0.04em; text-transform: uppercase; padding: 20px 20px 8px;
+  margin: 0; font-size: 12.5px; font-weight: 700; color: var(--muted);
+  padding: 20px 20px 8px;
 }
 .wf-daylabel .wf-restored {
-  color: var(--accent); text-transform: none; letter-spacing: 0; font-weight: 700;
+  color: var(--wf-link); font-weight: 700;
 }
 
 .wf-entry {
-  display: block; width: auto; text-align: left; appearance: none; font: inherit;
+  display: block; width: calc(100% - 28px); text-align: left; appearance: none; font: inherit;
   margin: 0 14px 9px; padding: 13px 14px; border-radius: 16px; cursor: pointer;
   background: var(--surface); border: 1px solid var(--border);
   transition: transform .08s ease, border-color .15s ease; position: relative; overflow: hidden;
-  animation: wf-rise 0.22s ease both;
 }
 .wf-entry:active { transform: scale(0.986); }
 .wf-entry:hover { border-color: var(--wf-line2); }
@@ -195,6 +186,11 @@ export const CSS = `
 .wf-entry-title {
   display: flex; gap: 7px; align-items: flex-start;
   font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.34; color: var(--text);
+}
+.wf-entry-context {
+  display: -webkit-box; margin: 5px 0 0 16px; overflow: hidden;
+  color: var(--muted); font-size: 12px; line-height: 1.4;
+  -webkit-box-orient: vertical; -webkit-line-clamp: 2;
 }
 .wf-stat { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; margin-top: 5px; background: var(--muted); }
 .wf-stat.done { background: var(--wf-done); }
@@ -205,15 +201,15 @@ export const CSS = `
   display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
 }
 .wf-result { color: var(--muted); }
-.wf-tasks { margin-left: auto; font-size: 11.5px; color: var(--wf-faint); white-space: nowrap; }
+.wf-tasks { margin-left: auto; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 
 /* Pills + separator dot — shared by journal entries and turn meta. */
 .wf-pill {
   font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
   background: var(--wf-s3); color: var(--muted);
 }
-.wf-pill.is-area { background: var(--wf-accent-soft); color: var(--accent); }
-.wf-pill.is-reco { background: var(--wf-accent-soft); color: var(--accent); }
+.wf-pill.is-area { background: var(--wf-accent-soft); color: var(--wf-link); }
+.wf-pill.is-reco { background: var(--wf-accent-soft); color: var(--wf-link); }
 .wf-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--wf-line2); flex: 0 0 auto; }
 
 /* ===== Chat drill-in ======================================================= */
@@ -225,14 +221,14 @@ export const CSS = `
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
 }
 .wf-chan {
-  font-size: 11px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+  font-size: 11.5px; font-weight: 700;
   padding: 2px 7px; border-radius: 6px; background: var(--wf-s3); color: var(--muted);
 }
 .wf-hero-spacer { flex: 1 1 auto; }
 .wf-openchat {
   flex: 0 0 auto; appearance: none; font: inherit; font-weight: 600; font-size: 12.5px;
-  padding: 5px 11px; border-radius: 999px; cursor: pointer;
-  border: 1px solid var(--wf-line2); background: var(--surface); color: var(--accent);
+  min-height: 44px; padding: 8px 12px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--wf-line2); background: var(--surface); color: var(--wf-link);
 }
 .wf-openchat:active { transform: scale(0.97); }
 
@@ -249,6 +245,8 @@ export const CSS = `
   background: var(--bg); border: 2px solid var(--accent); display: grid; place-items: center; z-index: 2;
 }
 .wf-tnode > i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.wf-tnode.neutral { border-color: var(--muted); }
+.wf-tnode.neutral > i { background: var(--muted); }
 .wf-tnode.attn { border-color: var(--wf-attn); }
 .wf-tnode.attn > i { background: var(--wf-attn); }
 .wf-tnode.run { border-color: var(--wf-run); }
@@ -291,12 +289,13 @@ export const CSS = `
   padding: 3px 9px; border-radius: 999px; display: inline-flex; gap: 5px; align-items: center;
   background: var(--wf-s3); color: var(--muted);
 }
-.wf-sub-state.done { background: var(--wf-done-soft); color: var(--wf-done); }
-.wf-sub-state.run { background: var(--wf-run-soft); color: var(--wf-run); }
-.wf-sub-state.failed { background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); color: var(--danger, #c0392b); }
+.wf-sub-state.done { background: var(--wf-done-soft); color: var(--text); }
+.wf-sub-state.run { background: var(--wf-run-soft); color: var(--text); }
+.wf-sub-state.failed { background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); color: var(--text); }
 .wf-sub-state.stopped { background: var(--wf-s3); color: var(--muted); }
+.wf-sub-state.unknown { background: var(--wf-s3); color: var(--muted); }
 .wf-sub-ask { margin-top: 8px; font-size: 12.5px; color: var(--text); line-height: 1.4; }
-.wf-sub-ask .k { color: var(--wf-faint); font-weight: 600; }
+.wf-sub-ask .k { color: var(--muted); font-weight: 600; }
 .wf-strip { margin-top: 9px; display: flex; gap: 5px; flex-wrap: wrap; }
 .wf-act {
   font-size: 10.5px; font-weight: 600; font-family: var(--mono, monospace);
@@ -305,23 +304,22 @@ export const CSS = `
 }
 .wf-sub-res {
   margin-top: 9px; font-size: 12.5px; color: var(--muted); line-height: 1.4;
-  padding-left: 10px; border-left: 2px solid var(--wf-line2);
+  padding-top: 9px; border-top: 1px solid var(--wf-line2);
 }
-.wf-sub-open { position: absolute; right: 11px; bottom: 11px; color: var(--wf-faint); font-size: 15px; }
+.wf-sub-open { position: absolute; right: 11px; bottom: 11px; color: var(--muted); font-size: 15px; }
 
 /* Per-turn "Technical detail" disclosure — the raw words + commands, one tap down. */
 .wf-tech { margin-top: 10px; }
 .wf-tech-sum {
-  list-style: none; cursor: pointer; font-size: 12px; font-weight: 600; color: var(--wf-faint);
-  display: flex; align-items: center; gap: 6px; padding: 6px 0; min-height: 36px;
+  list-style: none; cursor: pointer; font-size: 12px; font-weight: 600; color: var(--muted);
+  display: flex; align-items: center; gap: 6px; padding: 8px 0; min-height: 44px;
 }
 .wf-tech-sum::-webkit-details-marker { display: none; }
 .wf-cx { display: inline-block; transition: transform .15s ease; }
 .wf-tech[open] .wf-cx { transform: rotate(90deg); }
 .wf-techbox { margin-top: 6px; padding: 11px 12px; border-radius: 11px; background: var(--wf-s3); border: 1px solid var(--border); }
 .wf-techbox-lbl {
-  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
-  color: var(--wf-faint); margin-bottom: 5px;
+  font-size: 11.5px; font-weight: 700; color: var(--muted); margin-bottom: 5px;
 }
 .wf-orig .wf-md { font-size: 12px; color: var(--muted); line-height: 1.5; }
 .wf-cmds { margin-top: 9px; display: flex; flex-direction: column; gap: 4px; }
@@ -339,18 +337,15 @@ export const CSS = `
 .wf-sd-k { margin-top: 5px; font-size: 12px; color: var(--muted); }
 
 .wf-sect {
-  margin: 16px 16px 0; padding: 13px 14px; border-radius: 15px;
-  background: var(--surface); border: 1px solid var(--border);
+  margin: 0 20px; padding: 18px 0; border-bottom: 1px solid var(--border);
 }
 .wf-sect-h {
-  margin: 0 0 8px; font-size: 11px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.05em; color: var(--wf-faint);
+  margin: 0 0 8px; font-size: 13px; font-weight: 700; color: var(--muted);
 }
 .wf-sect-p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--text); }
 .wf-sect-p .wf-md { font-size: 13px; line-height: 1.5; color: var(--text); }
-.wf-sect.is-next { background: var(--wf-done-soft); border-color: color-mix(in srgb, var(--wf-done) 24%, transparent); }
-.wf-sect.is-next .wf-sect-h { color: var(--wf-done); }
-.wf-sect.is-tech { background: none; border-style: dashed; }
+.wf-sect.is-next .wf-sect-h { color: var(--text); }
+.wf-sect.is-tech { border-bottom: 0; }
 
 .wf-sd-steps { display: flex; flex-direction: column; gap: 2px; }
 .wf-stp {
@@ -425,5 +420,4 @@ export const CSS = `
 }
 .wf-md-pre code { white-space: pre; }
 
-@media (prefers-reduced-motion: reduce) { .wf-entry, .wf-sub { animation: none; } }
 `

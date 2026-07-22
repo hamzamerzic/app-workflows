@@ -25,13 +25,14 @@ export function providerClass(provider) {
 // ---------------------------------------------------------------------------
 // Ambient status — the three journal/turn states and their dot styling.
 // `done` is the quiet default; `attention` is the amber "needs a look"; `run`
-// is in-progress. Anything unknown reads as done rather than inventing an alarm.
+// is in-progress. Anything unknown stays neutral rather than inventing success.
 // ---------------------------------------------------------------------------
 
 export function statusDot(status) {
+  if (status === 'done') return 'done'
   if (status === 'attention') return 'attn'
   if (status === 'running') return 'run'
-  return 'done'
+  return 'neutral'
 }
 
 // ---------------------------------------------------------------------------
@@ -55,10 +56,11 @@ export function avatarFor(kind) {
 // appear in the common path; `failed`/`stopped` are styled too so a drifted
 // state never renders unlabelled.
 export function subStateMeta(state) {
+  if (state === 'done') return { cls: 'done', glyph: '✓', label: 'done' }
   if (state === 'running') return { cls: 'run', glyph: '◌', label: 'running' }
   if (state === 'failed') return { cls: 'failed', glyph: '✕', label: 'failed' }
   if (state === 'stopped') return { cls: 'stopped', glyph: '‖', label: 'stopped' }
-  return { cls: 'done', glyph: '✓', label: 'done' }
+  return { cls: 'unknown', glyph: '?', label: 'status unavailable' }
 }
 
 // Icon for a `did[]` verb on the subagent detail step list.

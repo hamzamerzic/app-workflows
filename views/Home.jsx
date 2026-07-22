@@ -39,13 +39,15 @@ function EntryCard({ entry, onOpen }) {
   const dot = statusDot(entry.status)
   const tasks = Number.isFinite(entry.tasks) ? entry.tasks : null
   const reco = entry.recovered === true
-  const title = entry.title || entry.outcome || 'Untitled'
+  const headline = entry.outcome || entry.title || 'Untitled activity'
+  const context = entry.title && entry.title.trim() !== headline.trim() ? entry.title : ''
   return (
     <button type="button" className={`wf-entry${reco ? ' is-reco' : ''}`} onClick={() => onOpen(entry)}>
       <span className="wf-entry-title">
         <span className={`wf-stat ${dot}`} aria-hidden="true" />
-        <span>{title}</span>
+        <span>{headline}</span>
       </span>
+      {context && <span className="wf-entry-context">{context}</span>}
       <span className="wf-entry-meta">
         {entry.area && <span className="wf-pill is-area">{entry.area}</span>}
         {entry.result && <span className="wf-sep" aria-hidden="true" />}
@@ -104,12 +106,13 @@ export function Home({
         </div>
       </header>
 
-      {!loaded ? (
-        <div className="wf-scroll">
-          <div className="wf-loading"><div className="wf-spinner" aria-label="Loading" /></div>
-        </div>
-      ) : isEmpty ? (
-        <div className="wf-scroll">
+      <main className="wf-scroll">
+        {!loaded ? (
+          <div className="wf-loading" role="status" aria-live="polite">
+            <div className="wf-spinner" aria-hidden="true" />
+            <span className="wf-sr-only">Loading activity</span>
+          </div>
+        ) : isEmpty ? (
           <div className="wf-empty">
             <div className="wf-empty-mark" aria-hidden="true">✶</div>
             <div className="wf-empty-title">Nothing here yet</div>
@@ -124,31 +127,30 @@ export function Home({
               </button>
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="wf-scroll">
-          <NeedsStrip items={needs} onOpen={onOpenDetail} />
-          {groups.map((group) => {
-            const groupReco = group.items.some((e) => e && e.recovered === true)
-            return (
-              <React.Fragment key={group.key}>
-                <div className="wf-daylabel">
-                  {group.label}
-                  {groupReco && <span className="wf-restored"> · ✦ restored</span>}
-                </div>
-                {group.items.map((entry, i) => (
-                  <EntryCard
-                    key={entry.chat_id || `${group.key}:${i}`}
-                    entry={entry}
-                    onOpen={onOpenDetail}
-                  />
-                ))}
-              </React.Fragment>
-            )
-          })}
-          <div style={{ height: 20 }} />
-        </div>
-      )}
+        ) : (
+          <div className="wf-content">
+            <NeedsStrip items={needs} onOpen={onOpenDetail} />
+            {groups.map((group) => {
+              const groupReco = group.items.some((e) => e && e.recovered === true)
+              return (
+                <React.Fragment key={group.key}>
+                  <h2 className="wf-daylabel">
+                    {group.label}
+                    {groupReco && <span className="wf-restored"> · ✦ restored</span>}
+                  </h2>
+                  {group.items.map((entry, i) => (
+                    <EntryCard
+                      key={entry.chat_id || `${group.key}:${i}`}
+                      entry={entry}
+                      onOpen={onOpenDetail}
+                    />
+                  ))}
+                </React.Fragment>
+              )
+            })}
+          </div>
+        )}
+      </main>
 
       {!online && <div className="wf-sync-pill" role="status">Offline</div>}
     </div>

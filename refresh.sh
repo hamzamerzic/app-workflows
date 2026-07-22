@@ -49,9 +49,9 @@ fi
 
 # --- no-overlap lock (flock) ------------------------------------------------
 # fd 9 holds the lock for the life of this process; flock -n fails fast if a
-# prior refresh (cron, run-now, or agent-trigger) is still running. The parser
-# is budgeted to <=10s, so a held lock means an unusually slow slice — skip
-# this trigger rather than pile a second parse onto the same cursors.
+# prior refresh (cron, run-now, or agent-trigger) is still running. Trace
+# scanning is budgeted to 10s; bounded metadata reads and storage publication
+# can extend total wall time. Skip rather than pile work onto the same cursors.
 exec 9>"$LOCK"
 if ! flock -n 9; then
   log "another refresh holds the lock; skipping (5)"

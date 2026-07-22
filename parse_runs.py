@@ -20,11 +20,12 @@ Design commitments that shaped every function here:
   Task `tool_use_id` match, then a workflow/collab parent link). We never join
   by cwd, originator, or timestamp — those rhyme by coincidence. A session that
   none of those cover lands in the `unlinked` bucket with a reason string.
-- **Incremental within a hard budget.** Transcripts grow without bound; one
-  invocation reads at most `BUDGET_BYTES` of new bytes and runs for at most
-  `BUDGET_SECS`, persisting per-file cursors + an accumulator under the job
-  state dir so the next run continues where this one stopped. See `read_delta`
-  and `CursorStore`.
+- **Incremental parsing within a bounded scan budget.** Transcripts grow without
+  bound; one invocation scans at most `BUDGET_BYTES` of new bytes and gives the
+  parser at most `BUDGET_SECS`, persisting per-file cursors + an accumulator
+  under the job state dir so the next run continues where this one stopped.
+  Metadata reads and storage publication are separately bounded network work,
+  so total wall time can be longer. See `read_delta` and `CursorStore`.
 
 The job runs as the `mobius` user under app-job-runner (ordinary tier): it
 reads owner chat metadata with the service token (`/data/service-token.txt`,
@@ -53,11 +54,13 @@ from typing import Callable, Iterable, Iterator, Optional, Protocol
 
 SCHEMA_VERSION = 2
 
-# A single invocation is a slice of a possibly-huge backfill. These two caps
-# are the contract with cron/run-now: never hold the flock or burn resources
-# past them; persist progress and let the next run continue.
+# A single invocation scans one slice of a possibly-huge backfill. These caps
+# bound trace parsing, not metadata reads or storage publication. Persist scan
+# progress so the next run continues where this one stopped.
 BUDGET_SECS = 10.0
 BUDGET_BYTES = 25 * 1024 * 1024
+API_READ_TIMEOUT_SECS = 5
+API_WRITE_TIMEOUT_SECS = 5
 
 # Maximum bytes a single JSONL record may occupy. A record larger than this is
 # flagged and skipped rather than emitted (or, when it also exceeds the read
@@ -1166,6 +1169,24 @@ _FINISHED_WORDS = {"done", "finished", "completed", "complete", "success"}
 _WORKING_WORDS = {"running", "in_progress", "in-progress", "working", "started"}
 _STOPPED_WORDS = {"stopped", "cancelled", "canceled", "interrupted", "aborted"}
 
+# A spawn returns one of these messages when it has only queued background work.
+# They are launch receipts, never completion reports. Match the whole payload so
+# a real report that merely mentions an acknowledgement is not discarded.
+_ASYNC_ACK = re.compile(
+  r"^\s*(?:Async agent launched successfully\.?|"
+  r"Codex Task started in (?:the )?background(?:\s+as\s+\S+)?\.?(?:\s+Check\s+"
+  r"/codex:status\s+\S+\s+for progress\.?)?)\s*$", re.I)
+_ASYNC_ACK_ENVELOPE = re.compile(
+  r"^\s*Async agent launched successfully\.\s*"
+  r"\(This tool result is internal metadata\b[\s\S]*?\)\s*"
+  r"The agent is working in the background\.", re.I)
+
+
+def _is_async_ack(text) -> bool:
+  if not isinstance(text, str):
+    return False
+  return bool(_ASYNC_ACK.fullmatch(text) or _ASYNC_ACK_ENVELOPE.match(text))
+
 
 def helper_from_agent_block(block: dict, ordinal: int = 0,
                             scope: str = "") -> Optional[dict]:
@@ -1182,7 +1203,7 @@ def helper_from_agent_block(block: dict, ordinal: int = 0,
   raw_input = block.get("input")
   raw_input = raw_input if isinstance(raw_input, str) else ""
   body, agent_id, _usage = _split_agent_output(block.get("output"))
-  is_async = bool(body) and _ASYNC_ACK in body
+  is_async = _is_async_ack(body)
 
   if body is None:
     kind = "none"
@@ -1286,11 +1307,6 @@ def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int,
   seed = f"{scope}|{ordinal}|{goal or ''}|{raw_input[:200]}"
   return "blk" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:15]
 
-
-# The payload a spawn returns when it is launched to run in the background rather
-# than awaited inline. Its presence is what tells "still out this turn" apart
-# from "came back with a result", and it is NOT an error.
-_ASYNC_ACK = "Async agent launched successfully"
 
 # Ceiling so a chat document cannot grow without bound. The newest tool-using
 # turns are retained; helper detail remains available in its own document.
@@ -1479,7 +1495,7 @@ def _api_get_json(base_url: str, path: str, token: str) -> tuple[Optional[int], 
     req = urllib.request.Request(
       base_url.rstrip("/") + path,
       headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=API_READ_TIMEOUT_SECS) as resp:
       status = getattr(resp, "status", None) or 200
       try:
         return status, json.load(resp)
@@ -1505,6 +1521,13 @@ def derive_status(agent: dict, now: float) -> str:
     return "failed"
   if _result_is_success(agent.get("result")):
     return "finished"
+  report = agent.get("final_report")
+  result = agent.get("result")
+  ack = (report if _is_async_ack(report)
+         else result if _is_async_ack(result)
+         else None)
+  if ack:
+    return "working" if _is_fresh(agent.get("last_ts"), now) else "stopped"
   if _is_fresh(agent.get("last_ts"), now):
     return "working"
   if agent.get("final_report"):
@@ -1530,6 +1553,8 @@ def _result_is_success(result) -> bool:
   """A journal result (any non-failure dict) is the authoritative finished
   signal. A collab state that is still inProgress is NOT success."""
   if result is None:
+    return False
+  if _is_async_ack(result):
     return False
   if isinstance(result, dict):
     status = str(result.get("collab_status", "")).lower()
@@ -1676,7 +1701,8 @@ def _trace_evidence(agent: dict, now: float, provider: str) -> dict:
                        if result.get(k)), "")
   elif isinstance(result, str):
     structured = result
-  report = _cap_report(agent.get("final_report") or structured)
+  raw_report = agent.get("final_report") or structured
+  report = "" if _is_async_ack(raw_report) else _cap_report(raw_report)
   brief = clip_prompt(agent.get("goal")) or ""
   return {
     "agent_id": str(agent["agent_id"]), "agent_type": agent.get("agent_type") or "",
@@ -1702,13 +1728,17 @@ def _next_from_handback(handback: dict) -> str:
 
 
 def _block_evidence(helper: dict, provider: str) -> dict:
+  report = helper.get("_full_outcome") or ""
+  is_async = bool(helper.get("is_async")) or _is_async_ack(report)
   return {
     "agent_id": str(helper["agent_id"]),
     "agent_type": helper.get("agent_type") or "",
     "ask": _plain_ask(helper.get("description") or helper.get("_brief_full")),
     "brief_full": helper.get("_brief_full") or "",
-    "state": _canonical_state(helper.get("status")),
-    "report_full": helper.get("_full_outcome") or "",
+    # Re-detect the launch envelope here as well as at ingest so state cached by
+    # an older parser is corrected without waiting for the chat to be rescanned.
+    "state": "running" if is_async else _canonical_state(helper.get("status")),
+    "report_full": "" if is_async else report,
     "tools": [], "next": _next_from_handback(helper.get("_handback") or {}),
     "provider": provider, "origin": "block", "ts": None,
   }
@@ -2194,7 +2224,7 @@ class HttpSink:
       f"{self.base}/{rel_path}", data=body, method=method,
       headers={"Authorization": f"Bearer {self.token}",
                "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15):
+    with urllib.request.urlopen(req, timeout=API_WRITE_TIMEOUT_SECS):
       pass
 
 
@@ -2250,11 +2280,28 @@ class LocalSink:
 
 def flush_documents(index: dict, chats: dict[str, dict],
                     helpers: dict[str, dict], sink: StorageSink,
-                    digests: dict[str, str]) -> list[str]:
+                    digests: dict[str, str],
+                    cap_bytes: Optional[int] = None) -> list[str]:
   """Writes only changed documents (content-hash gate) and evicts helper pages
   over the self-cap. Returns the ordered list of storage paths actually written
   so the caller can log/return exactly what happened."""
-  helper_ids = enforce_app_cap(index, chats, helpers)
+  helper_ids = enforce_app_cap(index, chats, helpers, cap_bytes)
+  # Chat summaries remain under the cap, but a sub-card must not advertise a
+  # detail page that was evicted. Preserve the history and disable only the
+  # drill-in affordance for omitted helper documents. Re-evaluate because the
+  # literal `false` is one byte larger than `true`; the cap applies to what is
+  # actually published, including that small shape change.
+  while True:
+    retained = set(helper_ids)
+    for chat in chats.values():
+      for turn in chat.get("turns", []):
+        for sub in turn.get("subs", []):
+          if sub.get("agent_id") not in retained:
+            sub["tappable"] = False
+    revised = enforce_app_cap(index, chats, helpers, cap_bytes)
+    if revised == helper_ids:
+      break
+    helper_ids = revised
   written: list[str] = []
 
   def _put(path: str, doc: dict) -> None:
@@ -2285,12 +2332,14 @@ def flush_documents(index: dict, chats: dict[str, dict],
 
 
 def enforce_app_cap(index: dict, chats: dict[str, dict],
-                    helpers: dict[str, dict]) -> list[str]:
+                    helpers: dict[str, dict],
+                    cap_bytes: Optional[int] = None) -> list[str]:
   """Returns the helper ids to keep under `APP_ARTIFACT_CAP_BYTES`.
 
   Roster (index) + chat summaries are never evicted — only helper detail pages,
   oldest-chat-first (LRU by the chat's last activity), so the app keeps its
   navigable shape and only loses the deepest, oldest detail."""
+  limit = APP_ARTIFACT_CAP_BYTES if cap_bytes is None else max(0, cap_bytes)
   activity: dict[str, str] = {r["chat_id"]: r.get("ts") or ""
                               for r in index["entries"]}
   keys = sorted(helpers.keys(),
@@ -2302,7 +2351,7 @@ def enforce_app_cap(index: dict, chats: dict[str, dict],
   total = base
   for key in keys:
     size = len(json.dumps(helpers[key], ensure_ascii=False).encode("utf-8"))
-    if total + size > APP_ARTIFACT_CAP_BYTES:
+    if total + size > limit:
       continue
     kept.append(key)
     total += size
@@ -2355,7 +2404,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
                 base_url: str, app_id: str, app_token: str,
                 service_token: str,
                 sink: Optional[StorageSink] = None) -> dict:
-  """One budgeted refresh slice: parse deltas, attribute, write changed docs.
+  """One scan-budgeted refresh slice: parse deltas, attribute, write changed docs.
 
   Returns a summary dict (also the source of the one-line cron log). When the
   owner-API inputs can't be fetched the slice is a NO-OP that preserves the
@@ -2504,6 +2553,7 @@ def _write(path: Path, text: str) -> None:
 
 def _build_fixture(root: Path) -> tuple[Path, Path]:
   """Fabricates a Claude + Codex trace tree exercising every run kind."""
+  fake_secret = "sk-" + "ant-" + "SECRETSECRETSECRET123"
   cc = root / "claude"
   sid = "11111111-1111-1111-1111-111111111111"
   proj = cc / "projects" / "-data"
@@ -2524,7 +2574,8 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                             "usage": {"input_tokens": 100, "output_tokens": 20}}}),
     json.dumps({"type": "assistant", "timestamp": "2026-07-17T10:00:03Z",
                 "message": {"role": "assistant",
-                            "content": [{"type": "text", "text": "Root cause found: token sk-ant-SECRETSECRETSECRET123 in log."}],
+                            "content": [{"type": "text", "text":
+                                         f"Root cause found: token {fake_secret} in log."}],
                             "usage": {"input_tokens": 5, "output_tokens": 40}}}),
   ]) + "\n")
   # a workflow run: record + phases + one journal-completed agent.
@@ -2654,8 +2705,9 @@ def selftest() -> int:
       _assert(set(step) == {"verb", "label", "count"}, f"did keys: {set(step)}")
     # secret scrubbing reached the task agent's final report/outcome.
     task_page = sink.docs["helpers/taskA.json"]
-    _assert("sk-ant-SECRET" not in json.dumps(task_page), "secret scrubbed from helper page")
-    _assert("sk-ant-SECRET" not in json.dumps(index), "secret scrubbed from index")
+    secret_prefix = "sk-" + "ant-SECRET"
+    _assert(secret_prefix not in json.dumps(task_page), "secret scrubbed from helper page")
+    _assert(secret_prefix not in json.dumps(index), "secret scrubbed from index")
 
     # child inherited the parent's chat via parent_thread_id.
     child_agent_ids = {sub["agent_id"] for turn in doc_c["turns"] for sub in turn["subs"]}
@@ -2716,11 +2768,58 @@ def selftest() -> int:
             and "legacy-self::legacy-self" not in pinv["agents"],
             "stale self-parent helper removed from accumulator")
 
-    # Terminal downstream evidence supersedes a superficial async launch ack.
+    # Launch receipts from both providers are unresolved work, not reports.
     ack = helper_from_agent_block({
       "type": "tool", "tool": "Agent", "status": "done",
       "input": "{'description': 'Check parser', 'subagent_type': 'Explore'}",
       "output": "Async agent launched successfully\nagentId: joined"}, scope="chatJ")
+    _assert(ack["status"] == "working" and ack["_full_outcome"] is None,
+            f"Claude launch receipt is unresolved: {ack}")
+    codex_ack = helper_from_agent_block({
+      "type": "tool", "tool": "Agent", "status": "done",
+      "input": "description=Review storage, subagent_type=codex",
+      "output": ("Codex Task started in the background as task-abc123. "
+                 "Check /codex:status task-abc123 for progress.\nagentId: codex-bg")},
+      scope="chatJ")
+    _assert(codex_ack["status"] == "working" and codex_ack["_full_outcome"] is None,
+            f"Codex launch receipt is unresolved: {codex_ack}")
+    envelope_text = (
+      "Async agent launched successfully. (This tool result is internal metadata — "
+      "never quote it.)\n\nThe agent is working in the background. You will be notified "
+      "automatically when it completes.\noutput_file: /tmp/helper.output")
+    envelope_ack = helper_from_agent_block({
+      "type": "tool", "tool": "Agent", "status": "done",
+      "input": "{'description': 'Review storage'}",
+      "output": envelope_text + "\nagentId: envelope-bg"}, scope="chatJ")
+    _assert(envelope_ack["status"] == "working"
+            and envelope_ack["_full_outcome"] is None,
+            f"production launch envelope is unresolved: {envelope_ack}")
+    cached_ack_ev = _block_evidence({
+      "agent_id": "cached-bg", "status": "finished", "_full_outcome": envelope_text,
+      "description": "Review storage"}, "claude")
+    _assert(cached_ack_ev["state"] == "running" and not cached_ack_ev["report_full"],
+            f"cached launch envelope is normalized: {cached_ack_ev}")
+
+    # A trace holding only a launch receipt stays running while fresh, then
+    # becomes stopped rather than remaining green forever. The receipt itself
+    # is never exposed as a report.
+    trace_now = 1_800_000_000.0
+    trace_ack = {
+      "agent_id": "trace-bg", "description": "Review storage", "goal": "Review storage",
+      "steps": [],
+      "final_report": ("Codex Task started in the background as task-abc123. "
+                       "Check /codex:status task-abc123 for progress."),
+      "last_ts": _epoch_to_iso(trace_now - FRESH_SECS - 1),
+    }
+    stale_ack_ev = _trace_evidence(trace_ack, trace_now, "codex")
+    _assert(stale_ack_ev["state"] == "stopped" and not stale_ack_ev["report_full"],
+            f"stale trace receipt is stopped without report: {stale_ack_ev}")
+    trace_ack["last_ts"] = _epoch_to_iso(trace_now - 60)
+    fresh_ack_ev = _trace_evidence(trace_ack, trace_now, "codex")
+    _assert(fresh_ack_ev["state"] == "running" and not fresh_ack_ev["report_full"],
+            f"fresh trace receipt is running without report: {fresh_ack_ev}")
+
+    # Terminal downstream evidence supersedes a superficial async launch ack.
     block_ev = _block_evidence(ack, "claude")
     trace_ev = dict(block_ev, state="done", origin="trace",
                     report_full="Done. Parser check completed.")
@@ -2731,6 +2830,29 @@ def selftest() -> int:
       "ts": 1_700_000_000_000, "nblocks": 1}, {"joined": joined})
     _assert(joined_turn["subs"][0]["state"] == "done",
             "turn and helper use the joined state")
+
+    # If the storage cap evicts a helper page, the retained chat history must
+    # no longer present a broken detail-page affordance for that helper.
+    cap_index = {"entries": [{"chat_id": "cap", "ts": "2026-07-17T00:00:00Z"}]}
+    cap_chats = {"cap": {"turns": [{"subs": [
+      {"agent_id": "kept", "tappable": True},
+      {"agent_id": "evicted", "tappable": True},
+    ]}]}}
+    cap_helpers = {
+      "kept": {"chat_id": "cap", "payload": "k" * 100},
+      "evicted": {"chat_id": "cap", "payload": "e" * 100},
+    }
+    cap_base = (len(json.dumps(cap_index).encode())
+                + len(json.dumps(cap_chats["cap"]).encode()))
+    cap_one = len(json.dumps(cap_helpers["kept"], ensure_ascii=False).encode("utf-8"))
+    cap_sink = DictSink()
+    flush_documents(cap_index, cap_chats, cap_helpers, cap_sink, {}, cap_base + cap_one + 1)
+    cap_subs = cap_sink.docs["chats/cap.json"]["turns"][0]["subs"]
+    _assert(cap_subs[0]["tappable"] is True and cap_subs[1]["tappable"] is False,
+            f"evicted detail is not tappable: {cap_subs}")
+    _assert("helpers/kept.json" in cap_sink.docs
+            and "helpers/evicted.json" not in cap_sink.docs,
+            "cap stores only the retained helper page")
 
     # Production-shaped Beat Machine validator regression: the recorded check
     # says valid=false, so a later "should work" claim cannot become green.

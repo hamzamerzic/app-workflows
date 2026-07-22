@@ -64,8 +64,11 @@ export default function App({ appId, token }) {
   // would let two rapid taps both pass the check) + a mounted flag so a poll
   // scheduled around an await never fires after unmount.
   const refreshInFlightRef = useRef(false)
-  const mountedRef = useRef(true)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   // Live index.json — repaints Home whenever the job rewrites it.
   useEffect(() => {

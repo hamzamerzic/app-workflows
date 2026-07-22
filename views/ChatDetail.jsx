@@ -88,12 +88,13 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
         <span className="wf-spacer" />
       </header>
 
-      {!loaded ? (
-        <div className="wf-scroll">
-          <div className="wf-loading"><div className="wf-spinner" aria-label="Loading" /></div>
-        </div>
-      ) : isEmpty ? (
-        <div className="wf-scroll">
+      <main className="wf-scroll" ref={scrollRef} onScroll={onScroll}>
+        {!loaded ? (
+          <div className="wf-loading" role="status" aria-live="polite">
+            <div className="wf-spinner" aria-hidden="true" />
+            <span className="wf-sr-only">Loading chat activity</span>
+          </div>
+        ) : isEmpty ? (
           <div className="wf-empty">
             <div className="wf-empty-mark" aria-hidden="true">✶</div>
             <div className="wf-empty-title">No recorded activity</div>
@@ -102,26 +103,26 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
               next time its helpers run.
             </p>
           </div>
-        </div>
-      ) : (
-        <div className="wf-scroll" ref={scrollRef} onScroll={onScroll}>
-          <div className="wf-chat-hero">
-            <h2 className="wf-chat-title">{title}</h2>
-            <div className="wf-chat-meta">
-              {provider && <span className="wf-chan">{providerLabel(provider)}</span>}
-              {provider && <span className="wf-sep" aria-hidden="true" />}
-              <span>
-                {turns.length} step{turns.length === 1 ? '' : 's'}{when ? ` · ${when}` : ''}
-              </span>
-              <span className="wf-hero-spacer" />
-              <button type="button" className="wf-openchat" onClick={() => onOpenChat(chatId)}>
-                Open chat ↗
-              </button>
+        ) : (
+          <div className="wf-content">
+            <div className="wf-chat-hero">
+              <h1 className="wf-chat-title">{title}</h1>
+              <div className="wf-chat-meta">
+                {provider && <span className="wf-chan">{providerLabel(provider)}</span>}
+                {provider && <span className="wf-sep" aria-hidden="true" />}
+                <span>
+                  {turns.length} step{turns.length === 1 ? '' : 's'}{when ? ` · ${when}` : ''}
+                </span>
+                <span className="wf-hero-spacer" />
+                <button type="button" className="wf-openchat" onClick={() => onOpenChat(chatId)}>
+                  Open chat ↗
+                </button>
+              </div>
             </div>
+            <Timeline turns={turns} chatId={chatId} onOpenHelper={onOpenHelper} store={store} />
           </div>
-          <Timeline turns={turns} chatId={chatId} onOpenHelper={onOpenHelper} store={store} />
-        </div>
-      )}
+        )}
+      </main>
     </div>
   )
 }

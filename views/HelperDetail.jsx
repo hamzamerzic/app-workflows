@@ -38,6 +38,7 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
   const did = (rec && Array.isArray(rec.did)) ? rec.did : []
   const result = (rec && typeof rec.result === 'string') ? rec.result.trim() : ''
   const report = (rec && typeof rec.report_full === 'string') ? rec.report_full.trim() : ''
+  const reportIncludesResult = !!result && !!report && report.trimStart().startsWith(result)
   const next = (rec && typeof rec.next === 'string') ? rec.next.trim() : ''
   const commands = (rec && Array.isArray(rec.commands)) ? rec.commands : []
   const nothing = loaded && rec && !brief && did.length === 0 && !result && !report && !next && commands.length === 0
@@ -49,28 +50,28 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
         <span className="wf-spacer" />
       </header>
 
-      {!loaded ? (
-        <div className="wf-scroll">
-          <div className="wf-loading"><div className="wf-spinner" aria-label="Loading" /></div>
-        </div>
-      ) : rec === null ? (
-        <div className="wf-scroll">
+      <main className="wf-scroll">
+        {!loaded ? (
+          <div className="wf-loading" role="status" aria-live="polite">
+            <div className="wf-spinner" aria-hidden="true" />
+            <span className="wf-sr-only">Loading helper activity</span>
+          </div>
+        ) : rec === null ? (
           <div className="wf-empty">
             <div className="wf-empty-mark" aria-hidden="true">✶</div>
             <div className="wf-empty-title">No activity recorded</div>
             <p className="wf-empty-text">This subagent has no recorded activity to show.</p>
           </div>
-        </div>
-      ) : (
-        <div className="wf-scroll">
+        ) : (
+        <div className="wf-content">
           <div className="wf-sd-head">
             <span className={`wf-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
-            <h2 className="wf-sd-title">{shortTitle(ask)}</h2>
+            <h1 className="wf-sd-title">{shortTitle(ask)}</h1>
             <div className="wf-sd-k">{name} · {av.role}</div>
           </div>
 
           <div className="wf-sect">
-            <h3 className="wf-sect-h">The task it was given</h3>
+            <h2 className="wf-sect-h">The task it was given</h2>
             {brief
               ? <div className="wf-sect-p"><Markdown text={brief} /></div>
               : <p className="wf-sect-p">{ask}</p>}
@@ -78,7 +79,7 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
 
           {did.length > 0 && (
             <div className="wf-sect">
-              <h3 className="wf-sect-h">What it did</h3>
+              <h2 className="wf-sect-h">What it did</h2>
               <div className="wf-sd-steps">
                 {did.map((d, i) => (
                   <div className="wf-stp" key={i}>
@@ -97,10 +98,10 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
 
           {(result || report) && (
             <div className="wf-sect">
-              <h3 className="wf-sect-h">What it reported back</h3>
-              {result && <p className="wf-sect-p">{result}</p>}
+              <h2 className="wf-sect-h">What it reported back</h2>
+              {result && !reportIncludesResult && <p className="wf-sect-p">{result}</p>}
               {report && (
-                <div className="wf-sect-p" style={result ? { marginTop: 8 } : undefined}>
+                <div className="wf-sect-p" style={result && !reportIncludesResult ? { marginTop: 8 } : undefined}>
                   <Markdown text={report} />
                 </div>
               )}
@@ -109,14 +110,14 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
 
           {next && (
             <div className="wf-sect is-next">
-              <h3 className="wf-sect-h">What happened next</h3>
+              <h2 className="wf-sect-h">What happened next</h2>
               <div className="wf-sect-p"><Markdown text={next} /></div>
             </div>
           )}
 
           {commands.length > 0 && (
             <div className="wf-sect is-tech">
-              <h3 className="wf-sect-h">Under the hood</h3>
+              <h2 className="wf-sect-h">Under the hood</h2>
               <div className="wf-cmds">
                 {commands.map((c, i) => <div className="wf-cmd" key={i}>{c}</div>)}
               </div>
@@ -129,7 +130,8 @@ export function HelperDetail({ storage, chatId, agentId, agentMeta, onBack }) {
             </div>
           )}
         </div>
-      )}
+        )}
+      </main>
     </div>
   )
 }

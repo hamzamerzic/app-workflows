@@ -1,50 +1,35 @@
 # Workflows
 
-A git-graph timeline of your Möbius chats. When a chat hands work off to a
-background helper — a subagent it spawns to investigate, verify, or build
-something — Workflows shows it as a branch off that turn, and how the branch
-ended: **merged back** (returned), **still out on its own** (launched),
-**failed** (the agent carried on), or **stopped**.
+Workflows is an outcome journal for the background work in your Möbius chats. The journal leads with completed outcomes and groups activity by day. A “worth a look” strip gathers unfinished, failed, or unconfirmed work.
 
-It reads what already happened. Every chat records each helper it spawns as a
-tool call whose input holds the brief and whose output holds what came back, so
-Workflows can show helpers that predate any of this — no new instrumentation.
+Open an entry to see the chat’s recorded steps and helpers. Open a helper to see its task, tools, report, and follow-up context. Technical detail stays available without making the journal read like a machine log.
 
-## What you see
+## What it records
 
-- **Turn by turn, at a high level.** Each turn is one compact card: a gist of
-  what the agent was doing (its own closing words) and the subagents it spawned.
-  The full step-by-step trail is one tap away under **Show activity**, so a long
-  turn stays a card instead of a wall of rows.
-- **The subagents, foregrounded.** A turn's helpers read as a clean cluster —
-  each with its type, model, and lifecycle — even when several ran in one turn.
-- **The brief each was given.** Expand **Instructions** on a helper to see the
-  recorded preview of its prompt.
-- **Markdown** in gists, notes, instructions, and reports.
-- **A helper's full record.** Tap a helper to open its page — the report it
-  handed back, what the chat did next, and its metrics.
+The journal records four layers of background activity:
 
-## Honesty
+- The outcome and status of each chat with background activity.
+- A turn-by-turn drill-in with any recorded verification concern.
+- Each helper’s brief, lifecycle, tool summary, report, and follow-up context.
+- The assistant’s original words and recorded commands under Technical detail.
 
-The timeline shows only what the transcript recorded. Text is the agent's own
-words, scrubbed and capped — never a generated summary. A missing value is
-omitted, never shown as a fake zero. A status the payload contradicts (a helper
-written down as *done* whose payload is an API error) is corrected and flagged.
-The rail is **topological** — order is exact, spacing is not drawn to time,
-because most helpers carry no recorded finish time.
+## Evidence and status
 
-## How it works
+Workflows derives status from recorded artifacts. It never asks a model to judge whether its own work succeeded. Explicit failures override bookkeeping. A background-launch acknowledgement never counts as a completion report. A fresh unresolved launch appears as running. If it ages out without a result, it appears as stopped. Later terminal evidence can still resolve it.
 
-A scheduled (and on-demand) job reads your chats with the owner service token
-and digests them into the app's own storage — a roster, one document per chat
-(its turns), and one page per helper. The mini-app reads only that storage. The
-job script is `refresh.sh`; the parser is `parse_runs.py`.
+The parser scrubs secret-shaped values from free text and caps it before publication. The interface omits missing fields instead of inventing values. If the storage safety cap removes an old helper page, the chat history stays visible without a broken drill-in.
+
+## How Workflows builds the journal
+
+The scheduled and on-demand refresh job incrementally scans local Claude and Codex trace artifacts. It joins sessions to chats through explicit link evidence, then publishes schema v2 documents to the app’s storage. The interface reads only those documents. Job diagnostics retain unlinked traces instead of guessing which chat owns them.
+
+The scan budget splits large histories across multiple runs. Separate timeouts bound metadata reads and storage writes. A full refresh can therefore take longer than the scan budget.
 
 ## Install
 
-Install from the Möbius **App Store**, or point an instance at the manifest:
+Install Workflows from the Möbius **App Store**, or point an instance at this manifest:
 
-```
+```text
 https://raw.githubusercontent.com/mobius-os/app-workflows/main/mobius.json
 ```
 
