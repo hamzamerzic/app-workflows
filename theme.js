@@ -59,6 +59,7 @@ export const CSS = `
   padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
   background: var(--bg); color: var(--text); font-family: var(--font);
 }
+.wf-root, .wf-root *, .wf-root *::before, .wf-root *::after { box-sizing: border-box; }
 .wf-root :where(button, summary) {
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
@@ -226,13 +227,13 @@ export const CSS = `
 .wf-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .wf-flow { width: 100%; max-width: 760px; margin-inline: auto; padding: 20px 18px 48px; }
 .wf-flow-label { font-size: 11px; font-weight: 700; color: var(--muted); }
-.wf-root-task { position: relative; padding: 2px 0 28px 34px; }
+.wf-root-task { position: relative; padding: 2px 0 28px 110px; }
 .wf-root-task::after {
-  content: ""; position: absolute; left: 8px; top: 18px; bottom: -1px;
+  content: ""; position: absolute; left: 82px; top: 18px; bottom: -1px;
   width: 2px; background: var(--wf-line2);
 }
 .wf-root-node {
-  position: absolute; left: 0; top: 3px; z-index: 2; width: 18px; height: 18px;
+  position: absolute; left: 74px; top: 3px; z-index: 2; width: 18px; height: 18px;
   border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--bg);
 }
 .wf-root-body { min-width: 0; }
@@ -251,59 +252,92 @@ export const CSS = `
   width: max-content; min-height: 44px; display: flex; align-items: center; gap: 6px;
   list-style: none; cursor: pointer; color: var(--wf-link); font-size: 12px; font-weight: 650;
 }
-.wf-prompt-sum::-webkit-details-marker, .wf-branch-summary::-webkit-details-marker { display: none; }
-.wf-cx, .wf-branch-chevron { display: inline-block; transition: transform .16s ease; }
-.wf-prompt[open] .wf-cx, .wf-branch-detail[open] .wf-branch-chevron { transform: rotate(90deg); }
+.wf-prompt-sum::-webkit-details-marker { display: none; }
+.wf-cx { display: inline-block; transition: transform .16s ease; }
+.wf-prompt[open] .wf-cx { transform: rotate(90deg); }
 .wf-prompt-body {
   max-width: 70ch; margin-top: 4px; padding: 12px 14px; border-radius: 10px;
   background: var(--wf-s2); color: var(--text); font-size: 12.5px; line-height: 1.55;
 }
 
-.wf-timeline { position: relative; }
-.wf-flow-turn {
-  position: relative; padding: 8px 0 26px 34px;
-  content-visibility: auto; contain-intrinsic-size: auto 180px;
+/* The lane canvas is horizontally scrollable without creating a second
+   vertical scroller. Fixed geometry keeps layout deterministic and cheap. */
+.wf-time-section { position: relative; min-width: 0; }
+.wf-time-section:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.wf-time-summary {
+  margin: 0 0 8px 82px; color: var(--muted); font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
-.wf-flow-turn::before {
-  content: ""; position: absolute; left: 8px; top: 0; bottom: -1px;
-  width: 2px; background: var(--wf-line2);
+.wf-time-scroll {
+  width: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-inline: contain;
+  touch-action: pan-x pan-y; scrollbar-gutter: stable;
 }
-.wf-flow-turn:last-child::before { bottom: calc(100% - 19px); }
-.wf-flow-node {
-  position: absolute; left: 2px; top: 12px; z-index: 2; width: 14px; height: 14px;
-  border-radius: 50%; background: var(--wf-done); border: 3px solid var(--bg);
-  box-shadow: 0 0 0 2px var(--wf-done);
+.wf-time-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.wf-time-canvas { position: relative; min-width: 100%; contain: layout paint style; }
+.wf-time-events { position: absolute; inset: 0; list-style: none; margin: 0; padding: 0; }
+.wf-time-event {
+  position: absolute; top: var(--wf-y); left: 0; width: 100%; height: 1px;
+  pointer-events: none;
 }
-.wf-flow-node.run { background: var(--wf-run); box-shadow: 0 0 0 2px var(--wf-run); }
-.wf-flow-node.failed { background: var(--danger, #c0392b); box-shadow: 0 0 0 2px var(--danger, #c0392b); }
-.wf-flow-node.stopped, .wf-flow-node.unknown { background: var(--wf-attn); box-shadow: 0 0 0 2px var(--wf-attn); }
-.wf-turn-main { min-width: 0; }
-.wf-toutcome {
-  font-size: 14px; font-weight: 650; letter-spacing: -0.01em;
-  line-height: 1.4; color: var(--text);
+.wf-time-clock {
+  position: sticky; left: 0; z-index: 8; display: block; width: 66px;
+  transform: translateY(-50%); padding: 3px 6px 3px 0;
+  background: var(--bg); color: var(--muted); font-size: 10.5px;
+  line-height: 1; text-align: right; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.wf-turn-note {
-  max-width: 66ch; margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45;
+.wf-time-event-body {
+  position: absolute; left: var(--wf-x); top: 0; z-index: 5;
+  width: 136px; transform: translate(12px, -50%); pointer-events: auto;
+  content-visibility: auto; contain-intrinsic-size: 60px 136px;
 }
-
-.wf-branch-list { margin-top: 13px; display: flex; flex-direction: column; gap: 7px; }
-.wf-branch {
-  position: relative; margin-left: calc(var(--wf-branch-depth, 0) * 18px);
-  padding-left: 18px; content-visibility: auto; contain-intrinsic-size: auto 72px;
+.wf-time-drawing { position: absolute; inset: 0; overflow: visible; }
+.wf-main-lifeline, .wf-agent-lifeline, .wf-spawn-connector, .wf-connector-under,
+.wf-agent-ragged {
+  fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round;
 }
-.wf-branch-line {
-  position: absolute; left: -26px; top: 23px; width: 38px; height: 12px;
-  border-top: 1px solid var(--wf-line2); border-left: 1px solid var(--wf-line2);
-  border-radius: 7px 0 0 0;
+.wf-main-lifeline { stroke: var(--wf-line2); stroke-width: 2; }
+.wf-agent-lifeline { stroke: var(--wf-run); stroke-width: 2; }
+.wf-agent-lifeline.is-open { stroke-dasharray: 5 5; }
+.wf-connector-under { stroke: var(--bg); stroke-width: 5; }
+.wf-spawn-connector { stroke: var(--wf-line2); stroke-width: 1.5; }
+.wf-spawn-connector.is-unknown { stroke-dasharray: 4 4; }
+.wf-agent-ragged { stroke: var(--muted); stroke-width: 1.5; }
+.wf-agent-start-node, .wf-main-event-node {
+  fill: var(--wf-run); stroke: var(--bg); stroke-width: 3; vector-effect: non-scaling-stroke;
 }
-.wf-branch-detail { margin: 0; }
-.wf-branch-summary {
-  min-height: 50px; display: flex; align-items: center; gap: 9px; list-style: none;
-  padding: 8px 10px; border-radius: 11px; cursor: pointer; background: var(--surface);
-  transition: background .15s ease;
+.wf-main-event-node { fill: var(--accent); }
+.wf-agent-end-node { fill: var(--muted); stroke: var(--bg); stroke-width: 3; vector-effect: non-scaling-stroke; }
+.wf-agent-end-node.done { fill: var(--wf-done); }
+.wf-agent-end-node.run { fill: var(--wf-run); }
+.wf-agent-end-node.failed { fill: var(--danger, #c0392b); }
+.wf-agent-end-node.stopped, .wf-agent-end-node.unknown { fill: var(--wf-attn); }
+.wf-time-main-card { display: flex; flex-direction: column; gap: 2px; padding: 4px 5px; background: var(--bg); }
+.wf-time-main-head { display: flex; align-items: center; gap: 5px; }
+.wf-time-main-label, .wf-time-agent-name {
+  color: var(--muted); font-size: 10.5px; font-weight: 700;
 }
-.wf-branch-summary:hover { background: var(--wf-s2); }
-.wf-branch-summary.is-static { cursor: default; }
+.wf-time-main-state { margin-left: auto; color: var(--muted); font-size: 9px; font-weight: 700; }
+.wf-time-main-state.done { color: var(--wf-done); }
+.wf-time-main-state.failed { color: var(--danger, #c0392b); }
+.wf-time-main-state.stopped { color: var(--wf-attn); }
+.wf-time-main-state.run { color: var(--wf-run); }
+.wf-time-main-copy {
+  display: -webkit-box; overflow: hidden; color: var(--text); font-size: 12.5px;
+  font-weight: 650; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
+.wf-time-main-flag {
+  display: -webkit-box; overflow: hidden; color: var(--muted); font-size: 9.5px;
+  line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 1;
+}
+.wf-time-launch {
+  width: 136px; min-height: 54px; display: flex; align-items: flex-start; gap: 8px;
+  margin: 0; padding: 7px 8px; appearance: none; text-align: left; font: inherit;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 11px; cursor: pointer; transition: background .15s ease, border-color .15s ease;
+}
+.wf-time-launch:hover, .wf-time-launch.is-selected { background: var(--wf-s2); border-color: var(--wf-line2); }
+.wf-time-launch.is-static { cursor: default; }
 .wf-avatar {
   flex: 0 0 auto; width: 26px; height: 26px; border-radius: 8px;
   display: grid; place-items: center; font-size: 14px; background: var(--wf-s3);
@@ -311,9 +345,23 @@ export const CSS = `
 .wf-avatar.explore { background: color-mix(in srgb, #4f83d6 16%, var(--surface)); }
 .wf-avatar.codex { background: color-mix(in srgb, #8a63d6 16%, var(--surface)); }
 .wf-avatar.build { background: color-mix(in srgb, var(--green, #3f9a5a) 16%, var(--surface)); }
-.wf-branch-copy { min-width: 0; display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; }
-.wf-branch-name { font-size: 11px; font-weight: 650; color: var(--muted); }
-.wf-branch-ask { font-size: 13px; font-weight: 550; line-height: 1.35; color: var(--text); }
+.wf-time-launch-copy { min-width: 0; display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; }
+.wf-time-agent-task {
+  display: -webkit-box; overflow: hidden; font-size: 11.5px; font-weight: 600;
+  line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
+.wf-time-parent-note { color: var(--muted); font-size: 10px; line-height: 1.25; }
+.wf-time-parent-note.is-parent { display: none; }
+.wf-time-end-note { color: var(--muted); font-size: 9.5px; line-height: 1.2; }
+.wf-time-small-event, .wf-time-terminal-label {
+  display: inline-flex; width: max-content; max-width: 136px; min-height: 28px;
+  align-items: center; padding: 4px 7px; border-radius: 8px;
+  background: var(--bg); color: var(--muted); font-size: 10.5px; font-weight: 650;
+  white-space: nowrap;
+}
+.wf-time-terminal-label.done { color: var(--text); background: var(--wf-done-soft); }
+.wf-time-terminal-label.failed { color: var(--text); background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); }
+.wf-time-terminal-label.stopped, .wf-time-terminal-label.unknown { background: var(--wf-s3); }
 .wf-sub-state {
   flex: 0 0 auto; font-size: 10.5px; font-weight: 650;
   padding: 3px 8px; border-radius: 999px; display: inline-flex; gap: 4px; align-items: center;
@@ -324,23 +372,57 @@ export const CSS = `
 .wf-sub-state.failed { background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); color: var(--text); }
 .wf-sub-state.stopped { background: var(--wf-s3); color: var(--muted); }
 .wf-sub-state.unknown { background: var(--wf-s3); color: var(--muted); }
-.wf-branch-chevron { color: var(--muted); font-size: 15px; }
-.wf-branch-prompt {
-  margin: 5px 0 4px; padding: 12px 12px 13px; border-radius: 10px;
-  background: var(--wf-s2); color: var(--text); font-size: 12.5px; line-height: 1.55;
-}
-.wf-branch-prompt .wf-flow-label { margin-bottom: 7px; }
 .wf-prompt-loading { color: var(--muted); font-size: 12px; }
-@media (max-width: 520px) {
+.wf-history-note {
+  margin: 0 0 12px; color: var(--muted); font-size: 11.5px; line-height: 1.4;
+}
+
+/* Prompt detail is deliberately outside the timeline flow, so opening it never
+   changes event positions. It is an accessible modal side sheet on desktop and
+   a full-width sheet in the narrow app frame. */
+.wf-inspector-backdrop {
+  position: fixed; z-index: 59; inset: 0; width: 100%; height: 100%; padding: 0;
+  border: 0; border-radius: 0; appearance: none; cursor: default;
+  background: color-mix(in srgb, #000 18%, transparent);
+}
+.wf-agent-inspector {
+  position: fixed; z-index: 60; top: calc(52px + env(safe-area-inset-top)); right: 0; bottom: 0; width: min(370px, 46vw);
+  display: flex; flex-direction: column; background: var(--surface); color: var(--text);
+  border-left: 1px solid var(--border); box-shadow: -2px 0 8px rgba(0, 0, 0, .16);
+}
+.wf-inspector-head {
+  flex: 0 0 auto; min-height: 66px; display: flex; align-items: center; gap: 12px;
+  padding: 11px 10px 10px 16px; border-bottom: 1px solid var(--border);
+}
+.wf-inspector-head > div { min-width: 0; flex: 1 1 auto; }
+.wf-inspector-head h2 { margin: 3px 0 0; font-size: 16px; line-height: 1.2; text-wrap: balance; }
+.wf-inspector-close {
+  flex: 0 0 auto; width: 44px; height: 44px; display: grid; place-items: center;
+  appearance: none; border: 0; border-radius: 9px; background: transparent;
+  color: var(--muted); font: inherit; font-size: 22px; cursor: pointer;
+}
+.wf-inspector-close:hover { background: var(--wf-s2); color: var(--text); }
+.wf-inspector-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  padding: 16px 16px calc(28px + env(safe-area-inset-bottom));
+}
+.wf-inspector-task { margin: 0; font-size: 14px; font-weight: 650; line-height: 1.45; }
+.wf-inspector-facts { margin: 16px 0 0; display: flex; flex-direction: column; gap: 8px; }
+.wf-inspector-facts > div { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 10px; align-items: center; }
+.wf-inspector-facts dt { color: var(--muted); font-size: 11.5px; }
+.wf-inspector-facts dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.wf-inspector-section { margin-top: 22px; }
+.wf-inspector-section h3 { margin: 0 0 8px; font-size: 12px; }
+.wf-inspector-section p { margin: 0; font-size: 12.5px; line-height: 1.5; }
+
+@media (max-width: 600px) {
   .wf-flow { padding-inline: 14px; }
   .wf-root-task, .wf-flow-turn { padding-left: 28px; }
   .wf-root-task::after, .wf-flow-turn::before { left: 7px; }
   .wf-root-node { left: 0; width: 16px; height: 16px; }
-  .wf-flow-node { left: 1px; }
-  .wf-branch { padding-left: 12px; margin-left: calc(var(--wf-branch-depth, 0) * 10px); }
-  .wf-branch-line { left: -21px; width: 29px; }
-  .wf-branch-summary { align-items: flex-start; }
-  .wf-sub-state { margin-top: 1px; }
+  .wf-agent-inspector {
+    top: calc(52px + env(safe-area-inset-top)); left: 0; width: 100%; border-left: 0; box-shadow: 0 -2px 8px rgba(0, 0, 0, .16);
+  }
 }
 
 /* mobius-ui:Empty — app-owned; a future-library candidate (no sync owed). */
@@ -368,7 +450,10 @@ export const CSS = `
   border: 2.5px solid color-mix(in srgb, var(--accent) 18%, transparent); border-top-color: var(--accent);
   animation: wf-spin 0.8s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) { .wf-spinner { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .wf-spinner { animation: none; }
+  .wf-cx, .wf-time-launch { transition: none; }
+}
 /* /mobius-ui:Spinner */
 
 /* mobius-ui:SyncPill — app-owned; a future-library candidate (no sync owed).

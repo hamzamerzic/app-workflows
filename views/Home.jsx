@@ -68,6 +68,7 @@ export function Home({
     : entries
   const groups = groupEntriesByDay(visibleEntries)
   const isEmpty = loaded && entries.length === 0
+  const omittedChats = Math.max(0, Number(idx && idx.history && idx.history.chats_omitted) || 0)
 
   return (
     <div className="wf-root">
@@ -134,6 +135,11 @@ export function Home({
               active={showAttention}
               onToggle={() => setAttentionOnly((value) => !value)}
             />
+            {omittedChats > 0 && (
+              <p className="wf-history-note">
+                Showing recent workflows · {omittedChats} older {omittedChats === 1 ? 'entry' : 'entries'} omitted
+              </p>
+            )}
             {groups.map((group) => {
               const groupReco = group.items.some((e) => e && e.recovered === true)
               return (

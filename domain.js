@@ -58,6 +58,356 @@ export function subStateMeta(state) {
 }
 
 // ---------------------------------------------------------------------------
+// Chronological helper timeline
+// ---------------------------------------------------------------------------
+
+export const TIMELINE_GEOMETRY = Object.freeze({
+  top: 34,
+  row: 68,
+  laneOrigin: 82,
+  laneGap: 152,
+  cardWidth: 136,
+  bottom: 46,
+})
+
+function isoMs(value) {
+  if (!value) return null
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
+}
+
+function canonicalAgentState(value) {
+  if (value === 'completed' || value === 'complete' || value === 'finished') return 'done'
+  if (value === 'cancelled' || value === 'canceled' || value === 'interrupted') return 'stopped'
+  if (value === 'working' || value === 'in_progress') return 'running'
+  return ['done', 'failed', 'stopped', 'running'].includes(value) ? value : 'unknown'
+}
+
+function eventType(raw) {
+  const type = String(raw.type || raw.kind || '')
+  if (type === 'agent_completed') return ['agent_terminal', 'done']
+  if (type === 'agent_failed') return ['agent_terminal', 'failed']
+  if (['agent_stopped', 'agent_interrupted', 'agent_cancelled'].includes(type)) {
+    return ['agent_terminal', 'stopped']
+  }
+  return [type, canonicalAgentState(raw.state)]
+}
+
+function normalizeEvent(raw, index) {
+  const [type, mappedState] = eventType(raw || {})
+  const occurredAt = raw.occurred_at || raw.at || null
+  const observedAt = raw.observed_at || occurredAt || null
+  const quality = occurredAt
+    ? (raw.time_quality || 'exact')
+    : observedAt ? 'observed' : 'unknown'
+  const order = Number.isFinite(Number(raw.order ?? raw.sequence ?? raw.id))
+    ? Number(raw.order ?? raw.sequence ?? raw.id)
+    : index
+  return {
+    event_id: String(raw.event_id || raw.id || `event-${index}`),
+    order,
+    type,
+    occurred_at: occurredAt,
+    observed_at: observedAt,
+    at: occurredAt || observedAt,
+    time_quality: quality,
+    actor_agent_id: raw.actor_agent_id || raw.parent_agent_id || null,
+    subject_agent_id: raw.subject_agent_id || raw.agent_id || null,
+    state: raw.state === 'attention' ? 'attention' : mappedState,
+    summary: raw.summary || raw.outcome || '',
+    flag: raw.flag || '',
+    _source_index: index,
+  }
+}
+
+function compareEvents(a, b) {
+  if (a.order !== b.order) return a.order - b.order
+  const am = isoMs(a.at)
+  const bm = isoMs(b.at)
+  if (am !== bm && am != null && bm != null) return am - bm
+  return a._source_index - b._source_index || a.event_id.localeCompare(b.event_id)
+}
+
+function v3Timeline(turns, mainAgentId) {
+  const agents = []
+  const events = []
+  let order = 0
+  for (const [turnIndex, turn] of (Array.isArray(turns) ? turns : []).entries()) {
+    const checkpointAt = turn && turn.ts
+    events.push(normalizeEvent({
+      event_id: `v3-main-${turnIndex}`,
+      order: order++,
+      type: 'main_checkpoint',
+      occurred_at: checkpointAt,
+      time_quality: checkpointAt ? 'observed' : 'unknown',
+      actor_agent_id: mainAgentId,
+      subject_agent_id: mainAgentId,
+      state: turn && turn.status,
+      summary: (turn && turn.outcome) || 'Continued the task',
+      flag: (turn && turn.flag) || '',
+    }, events.length))
+    for (const [subIndex, sub] of (Array.isArray(turn && turn.subs) ? turn.subs : []).entries()) {
+      const id = String(sub.agent_id || `v3-${turnIndex}-${subIndex}`)
+      agents.push({
+        agent_id: id,
+        parent_agent_id: null,
+        provider: sub.provider || '',
+        kind: sub.kind || 'general',
+        name: sub.name || '',
+        task_summary: sub.ask || 'No task summary was recorded',
+        state: canonicalAgentState(sub.state),
+        prompt_available: sub.prompt_available !== false,
+        outcome_summary: sub.outcome || '',
+        last_activity_at: null,
+        depth: Math.max(1, Number(sub.depth) || 1),
+        ancestry_quality: 'unknown',
+        legacy: true,
+      })
+      events.push(normalizeEvent({
+        event_id: `v3-spawn-${turnIndex}-${subIndex}`,
+        order: order++,
+        type: 'agent_spawned',
+        observed_at: checkpointAt,
+        time_quality: checkpointAt ? 'observed' : 'unknown',
+        actor_agent_id: mainAgentId,
+        subject_agent_id: id,
+        summary: sub.ask || '',
+      }, events.length))
+    }
+  }
+  return {
+    mainAgentId, agents, events,
+    retention: { agents_omitted: 0, events_omitted: 0 },
+  }
+}
+
+// Normalizes schema v4 while retaining a deliberately conservative schema-v3
+// fallback. V3 status is shown, but it never becomes a fabricated terminal
+// event: its lifetime therefore ends with the dashed "end not recorded" mark.
+export function normalizeTimeline(timeline, turns = []) {
+  if (!timeline || !Array.isArray(timeline.agents) || !Array.isArray(timeline.events)) {
+    return v3Timeline(turns, 'main')
+  }
+  const mainAgentId = String(timeline.main_agent_id || 'main')
+  const agents = timeline.agents.map((raw, index) => ({
+    agent_id: String(raw.agent_id || raw.id || `agent-${index}`),
+    chat_run_id: raw.chat_run_id == null ? null : String(raw.chat_run_id),
+    parent_agent_id: raw.parent_agent_id == null ? null : String(raw.parent_agent_id),
+    provider: raw.provider || '',
+    kind: raw.kind || raw.agent_type || 'general',
+    name: raw.name || '',
+    task_summary: raw.task_summary || raw.ask || raw.summary || 'No task summary was recorded',
+    state: canonicalAgentState(raw.state),
+    prompt_available: raw.prompt_available !== false,
+    outcome_summary: raw.outcome_summary || raw.outcome || '',
+    last_activity_at: raw.last_activity_at || null,
+    depth: Math.max(1, Number(raw.depth) || 1),
+    ancestry_quality: raw.ancestry_quality || (raw.parent_agent_id ? 'exact' : 'unknown'),
+    timing_conflict: raw.timing_conflict === true,
+    legacy: false,
+  }))
+  const events = timeline.events.map(normalizeEvent).filter((event) => event.type).sort(compareEvents)
+  const agentIndex = new Map(agents.map((agent) => [agent.agent_id, agent]))
+  const eventsByAgent = new Map()
+  for (const event of events) {
+    if (!event.subject_agent_id) continue
+    const list = eventsByAgent.get(event.subject_agent_id) || []
+    list.push(event)
+    eventsByAgent.set(event.subject_agent_id, list)
+  }
+  for (const agent of agents) {
+    const ownEvents = eventsByAgent.get(agent.agent_id) || []
+    const launch = ownEvents.find((event) => event.type === 'agent_spawned')
+    if (!agent.parent_agent_id && launch && launch.actor_agent_id) {
+      agent.parent_agent_id = String(launch.actor_agent_id)
+      agent.ancestry_quality = 'exact'
+    }
+    const terminal = [...ownEvents].reverse().find((event) => event.type === 'agent_terminal')
+    if (terminal && terminal.state !== 'unknown') agent.state = terminal.state
+  }
+  // Compute mobile indentation from the real parent chain. Stored depth is a
+  // fallback only; exact ancestry wins and cycles stop without guessing.
+  for (const agent of agents) {
+    let depth = 1
+    let parent = agent.parent_agent_id
+    const seen = new Set([agent.agent_id])
+    while (parent && parent !== mainAgentId && agentIndex.has(parent) && !seen.has(parent)) {
+      seen.add(parent)
+      depth += 1
+      parent = agentIndex.get(parent).parent_agent_id
+    }
+    if (depth > 1 || agent.parent_agent_id === mainAgentId) agent.depth = depth
+  }
+
+  // Main checkpoints are still the most useful skim layer. During migration,
+  // retain them from v3 turns without using their helper cards a second time.
+  if (!events.some((event) => event.type === 'main_checkpoint')) {
+    const checkpoints = turns.map((turn, index) => normalizeEvent({
+      event_id: `main-${index}`,
+      order: index,
+      type: 'main_checkpoint',
+      occurred_at: turn.ts,
+      time_quality: turn.ts ? 'observed' : 'unknown',
+      actor_agent_id: mainAgentId,
+      subject_agent_id: mainAgentId,
+      state: turn.status,
+      summary: turn.outcome || 'Continued the task',
+      flag: turn.flag || '',
+    }, index)).sort((a, b) => {
+      const am = isoMs(a.at)
+      const bm = isoMs(b.at)
+      if (am != null && bm != null && am !== bm) return am - bm
+      return a._source_index - b._source_index
+    })
+    // Preserve the parser's causal event order. Checkpoints are annotations,
+    // so insert each before the first later lifecycle time rather than sorting
+    // the authoritative events again by potentially skewed clocks.
+    const merged = []
+    let checkpointIndex = 0
+    for (const event of events) {
+      const eventMs = isoMs(event.at)
+      while (checkpointIndex < checkpoints.length) {
+        const checkpointMs = isoMs(checkpoints[checkpointIndex].at)
+        if (checkpointMs == null || eventMs == null || checkpointMs > eventMs) break
+        merged.push(checkpoints[checkpointIndex++])
+      }
+      merged.push(event)
+    }
+    merged.push(...checkpoints.slice(checkpointIndex))
+    events.splice(0, events.length, ...merged)
+  }
+  const rawRetention = timeline.retention && typeof timeline.retention === 'object'
+    ? timeline.retention : {}
+  return {
+    mainAgentId,
+    mainRuns: Array.isArray(timeline.main_runs) ? timeline.main_runs : [],
+    agents,
+    events,
+    retention: {
+      agents_omitted: Math.max(0, Number(rawRetention.agents_omitted) || 0),
+      events_omitted: Math.max(0, Number(rawRetention.events_omitted) || 0),
+    },
+  }
+}
+
+function extraTimeGap(previous, current) {
+  const a = isoMs(previous && previous.at)
+  const b = isoMs(current && current.at)
+  if (a == null || b == null || b <= a) return 0
+  const seconds = (b - a) / 1000
+  if (seconds <= 10) return 0
+  if (seconds <= 60) return 8
+  if (seconds <= 600) return 16
+  return 28
+}
+
+// Deterministic interval coloring: main is lane 0; helpers receive the lowest
+// free positive lane, never move while alive, and release only at an explicit
+// terminal event. Thus width follows peak concurrency rather than total work.
+export function layoutTimeline(timeline, turns = []) {
+  const normalized = normalizeTimeline(timeline, turns)
+  const agentsById = new Map(normalized.agents.map((agent) => [agent.agent_id, agent]))
+  const laneByAgent = new Map([[normalized.mainAgentId, 0]])
+  const activeByLane = new Map()
+  const rows = []
+  let y = TIMELINE_GEOMETRY.top
+  let maxLane = 0
+
+  for (const [index, event] of normalized.events.entries()) {
+    if (index) y += TIMELINE_GEOMETRY.row + extraTimeGap(normalized.events[index - 1], event)
+    // V3 has no terminal timestamps. Once its observed timestamp group has
+    // passed, recycle slots for helpers whose stored status is already final;
+    // their visual span remains short and ragged, never a fabricated finish.
+    if (index && normalized.events[index - 1].at !== event.at) {
+      for (const [lane, activeId] of activeByLane.entries()) {
+        const active = agentsById.get(activeId)
+        if (active && active.legacy && active.state !== 'running') activeByLane.delete(lane)
+      }
+    }
+    const id = event.subject_agent_id
+    if (event.type === 'agent_terminal') {
+      if (!laneByAgent.has(id) && id !== normalized.mainAgentId) {
+        let lane = 1
+        while (activeByLane.has(lane)) lane += 1
+        laneByAgent.set(id, lane)
+        activeByLane.set(lane, id)
+        maxLane = Math.max(maxLane, lane)
+      }
+      const lane = laneByAgent.get(id) ?? 0
+      rows.push({ ...event, lane, y })
+      if (lane > 0) activeByLane.delete(lane)
+      continue
+    }
+    if ((event.type === 'agent_spawned' || event.type === 'agent_started') && id !== normalized.mainAgentId) {
+      if (!laneByAgent.has(id)) {
+        let lane = 1
+        while (activeByLane.has(lane)) lane += 1
+        laneByAgent.set(id, lane)
+        activeByLane.set(lane, id)
+        maxLane = Math.max(maxLane, lane)
+      }
+    }
+    rows.push({ ...event, lane: laneByAgent.get(id) ?? 0, y })
+  }
+
+  const lastY = rows.length ? rows[rows.length - 1].y : TIMELINE_GEOMETRY.top
+  const terminalByAgent = new Map(rows.filter((row) => row.type === 'agent_terminal')
+    .map((row) => [row.subject_agent_id, row]))
+  const firstByAgent = new Map()
+  for (const row of rows) {
+    if (row.subject_agent_id && !firstByAgent.has(row.subject_agent_id)
+        && (row.type === 'agent_spawned' || row.type === 'agent_started')) {
+      firstByAgent.set(row.subject_agent_id, row)
+    }
+  }
+  const spans = normalized.agents.map((agent) => {
+    const start = firstByAgent.get(agent.agent_id)
+    if (!start) return null
+    const terminal = terminalByAgent.get(agent.agent_id)
+    const openEnd = agent.state === 'running'
+      ? Math.max(start.y + 48, lastY + 32)
+      : start.y + 52
+    return {
+      agent,
+      lane: laneByAgent.get(agent.agent_id) || 1,
+      startY: start.y,
+      endY: terminal ? terminal.y : openEnd,
+      terminal: terminal || null,
+      authoritativeEnd: Boolean(terminal),
+      startEvent: start,
+    }
+  }).filter(Boolean)
+  const spansByAgent = new Map(spans.map((span) => [span.agent.agent_id, span]))
+
+  const height = Math.max(150, lastY + TIMELINE_GEOMETRY.bottom + 36)
+  const width = TIMELINE_GEOMETRY.laneOrigin
+    + (maxLane + 1) * TIMELINE_GEOMETRY.laneGap + TIMELINE_GEOMETRY.cardWidth
+  return { ...normalized, agentsById, rows, spans, spansByAgent, laneByAgent, maxLane, width, height }
+}
+
+export function formatTimelineTime(value, quality = 'exact') {
+  const ms = isoMs(value)
+  if (ms == null) return 'Time unavailable'
+  const label = new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(new Date(ms))
+  return quality === 'exact' ? label : `~${label}`
+}
+
+export function formatDuration(start, end) {
+  const a = isoMs(start)
+  const b = isoMs(end)
+  if (a == null || b == null || b < a) return ''
+  const seconds = Math.round((b - a) / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+// ---------------------------------------------------------------------------
 // Day-grouping — the journal is grouped by calendar day using each entry's ts.
 // Labels: Today / Yesterday / weekday+date within the week / a plain date for
 // older / "Earlier" for anything with a null or unparseable ts. Entries arrive

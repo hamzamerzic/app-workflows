@@ -39,6 +39,7 @@ never couples to backend layout.
 from __future__ import annotations
 
 import argparse
+import heapq
 import hashlib
 import json
 import os
@@ -46,13 +47,14 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Protocol
 
 # --- schema + budget + caps -------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # A single invocation scans one slice of a possibly-huge backfill. These caps
 # bound trace parsing, not metadata reads or storage publication. Persist scan
@@ -95,10 +97,22 @@ ACCUM_STEP_CAP = 240
 # per-app 1 GiB storage quota; when exceeded we evict the oldest helper detail
 # prompt documents (never the roster or chat summaries) — see enforce_app_cap.
 APP_ARTIFACT_CAP_BYTES = 100 * 1024 * 1024
+# The journal's navigable core gets a smaller budget so full-prompt leaves can
+# still fit beneath APP_ARTIFACT_CAP_BYTES. These are product retention limits,
+# not request-time guesses: truncation is published explicitly in schema v4.
+BASE_ARTIFACT_TARGET_BYTES = 75 * 1024 * 1024
+MAX_TIMELINE_AGENTS = 400
+MAX_MAIN_RUNS_PER_CHAT = 100
+MAX_JOURNAL_CHATS = 1000
+MAX_LIFECYCLE_CACHE_EVENTS = 50_000
+MAX_LIFECYCLE_CACHE_RUNS = 10_000
+MAX_LIFECYCLE_CACHE_EVENTS_PER_CHAT = 2_000
+# At most spawn/start/terminal for every retained helper plus 40 owner turns.
+MAX_TIMELINE_EVENTS_PER_CHAT = MAX_TIMELINE_AGENTS * 3 + 40
 
 SCHEMA_NOTES = """\
-index.json  {schema, updated_at, needs_attention:[{chat_id,outcome}], entries:[...]}
-chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...]}
+index.json  {schema, updated_at, needs_attention:[...], entries:[...], history:{chats_omitted}}
+chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...], timeline:{...,retention}}
 helpers/<id> {schema, agent_id, chat_id, brief_full}
 """
 
@@ -404,6 +418,28 @@ def _msg_text_and_tools(msg: dict) -> tuple[Optional[str], list[tuple[str, str]]
   return text, tools
 
 
+def _msg_spawn_tool_ids(msg: dict) -> list[str]:
+  """Task/Agent tool ids launched by one Claude helper message.
+
+  Claude flattens helper transcript files inside a run. A nested child's meta
+  file names the ``toolUseId`` that launched it; retaining the matching id from
+  the parent's transcript gives us an exact parent edge instead of guessing
+  ancestry from ``spawnDepth``.
+  """
+  content = msg.get("content")
+  if not isinstance(content, list):
+    return []
+  out: list[str] = []
+  for block in content:
+    if (not isinstance(block, dict) or block.get("type") != "tool_use"
+        or block.get("name") not in SPAWNING_TOOL_NAMES or not block.get("id")):
+      continue
+    tool_id = str(block["id"])
+    if tool_id not in out:
+      out.append(tool_id)
+  return out
+
+
 def _short_input(inp) -> str:
   """A compact one-line description of a tool input for a step detail."""
   if isinstance(inp, dict):
@@ -439,10 +475,17 @@ def _new_model() -> dict:
 
 
 def _session(model: dict, sid: str, provider: str) -> dict:
-  s = model["sessions"].setdefault(sid, {
+  defaults = {
     "provider": provider, "last_activity_at": None,
-    "parent_thread_id": None, "tool_use_ids": [],
-  })
+    "parent_thread_id": None, "spawn_depth": None,
+    "spawn_label": "", "tool_use_ids": [],
+  }
+  s = model["sessions"].setdefault(sid, dict(defaults))
+  # Schema-3 accumulators are deliberately forward-migratable. Populate every
+  # newly introduced field when an existing session is first touched so an
+  # incremental refresh cannot fail halfway through and strand good storage.
+  for key, value in defaults.items():
+    s.setdefault(key, list(value) if isinstance(value, list) else value)
   s["provider"] = provider or s["provider"]
   return s
 
@@ -465,15 +508,21 @@ def _run(model: dict, sid: str, run_id: str, kind: str, label: str) -> dict:
 
 def _agent(model: dict, sid: str, run_id: str, agent_id: str, kind: str) -> dict:
   akey = f"{sid}::{agent_id}"
-  a = model["agents"].setdefault(akey, {
+  defaults = {
     "sid": sid, "run_id": run_id, "run_kind": kind, "agent_id": agent_id,
     "agent_type": "", "description": "", "tool_use_id": None, "goal": "",
-    "spawn_depth": 1,
+    "spawn_depth": 1, "parent_agent_id": None,
+    "spawned_tool_use_ids": [],
     "steps": [], "final_report": "", "tokens": 0, "started_at": None,
-    "last_ts": None, "has_activity": False, "result": None,
+    "started_time_quality": "unknown", "ended_at": None,
+    "ended_time_quality": "unknown", "last_ts": None,
+    "has_activity": False, "result": None,
     "final_report_terminal": None, "interrupted": False,
     "board_status": None, "source_expired": False, "truncated": False,
-  })
+  }
+  a = model["agents"].setdefault(akey, dict(defaults))
+  for key, value in defaults.items():
+    a.setdefault(key, list(value) if isinstance(value, list) else value)
   a["run_id"] = run_id
   a["run_kind"] = kind
   run = _run(model, sid, run_id, kind, "")
@@ -561,6 +610,31 @@ def _parse_agent_dir(agent_dir: Path, sid: str, run_id: str, kind: str,
     agent = _agent(model, sid, run_id, agent_id, kind)
     _load_agent_meta(tr.with_name(f"agent-{agent_id}.meta.json"), agent, model, sid)
     _fold_agent_transcript(tr, agent, model, sid, cursors, budget)
+  _resolve_claude_parents(model, sid, run_id)
+
+
+def _resolve_claude_parents(model: dict, sid: str, run_id: str) -> None:
+  """Join nested Claude children to the helper whose Task call spawned them.
+
+  A depth number alone never identifies a parent. Missing, duplicate, or cyclic
+  evidence therefore stays unknown; the public timeline renders that honestly.
+  """
+  agents = [a for a in model.get("agents", {}).values()
+            if a.get("sid") == sid and a.get("run_id") == run_id]
+  owners: dict[str, list[str]] = {}
+  for candidate in agents:
+    for tool_id in candidate.get("spawned_tool_use_ids", []):
+      owners.setdefault(str(tool_id), []).append(str(candidate["agent_id"]))
+  for child in agents:
+    tool_id = child.get("tool_use_id")
+    matches = owners.get(str(tool_id), []) if tool_id else []
+    child_id = str(child.get("agent_id") or "")
+    if len(matches) == 1 and matches[0] != child_id:
+      child["parent_agent_id"] = matches[0]
+    elif not child.get("_main_parent_evidence"):
+      # Reconciliation runs repeatedly as incremental files grow. Do not leave
+      # a formerly unique edge behind after later evidence makes it ambiguous.
+      child["parent_agent_id"] = None
 
 
 def _load_agent_meta(meta_path: Path, agent: dict, model: dict, sid: str) -> None:
@@ -572,6 +646,9 @@ def _load_agent_meta(meta_path: Path, agent: dict, model: dict, sid: str) -> Non
     agent["spawn_depth"] = max(1, int(meta.get("spawnDepth") or agent.get("spawn_depth") or 1))
   except (TypeError, ValueError):
     agent["spawn_depth"] = max(1, int(agent.get("spawn_depth") or 1))
+  if meta.get("spawnDepth") is not None and agent["spawn_depth"] == 1:
+    agent["parent_agent_id"] = "main"
+    agent["_main_parent_evidence"] = True
   if meta.get("description"):
     agent["description"] = str(meta["description"])
   tuid = meta.get("toolUseId")
@@ -597,6 +674,10 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
     ts = rec.get("timestamp")
     if ts:
       agent["started_at"] = agent["started_at"] or ts
+      if agent.get("started_time_quality") == "unknown":
+        # First transcript activity is an observed lower bound, not proof of
+        # the orchestration instant at which the helper was launched.
+        agent["started_time_quality"] = "observed"
       agent["last_ts"] = ts
       _bump_activity(session, ts)
     msg = rec.get("message")
@@ -610,6 +691,9 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
       if "[request interrupted by user]" in user_text.lower():
         agent["interrupted"] = True
         agent["has_activity"] = True
+        if ts:
+          agent["ended_at"] = ts
+          agent["ended_time_quality"] = "exact"
       if agent["goal"]:
         continue
       if isinstance(goal, str):
@@ -619,11 +703,20 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
                               if isinstance(b, dict) and b.get("type") == "text"), "")
     if role == "assistant":
       text, tools = _msg_text_and_tools(msg)
+      for tool_id in _msg_spawn_tool_ids(msg):
+        if tool_id not in agent["spawned_tool_use_ids"]:
+          agent["spawned_tool_use_ids"].append(tool_id)
       agent["tokens"] += _usage_tokens(msg)
       if text:
         agent["final_report"] = text
         agent["final_report_terminal"] = str(msg.get("stop_reason") or "").lower() in (
           "end_turn", "stop_sequence", "stop")
+        if agent["final_report_terminal"] and ts:
+          agent["ended_at"] = ts
+          agent["ended_time_quality"] = "exact"
+        elif not agent["final_report_terminal"]:
+          agent["ended_at"] = None
+          agent["ended_time_quality"] = "unknown"
         agent["interrupted"] = False
         agent["has_activity"] = True
       for name, detail in tools:
@@ -633,6 +726,8 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
         # text was progress—not a terminal handback.
         agent["final_report_terminal"] = False
         agent["interrupted"] = False
+        agent["ended_at"] = None
+        agent["ended_time_quality"] = "unknown"
         agent["has_activity"] = True
       _trim_accum_steps(agent)
 
@@ -651,7 +746,9 @@ def _reset_agent_digest(agent: dict) -> None:
   and lookup fields (agent_type, description, tool_use_id, goal, result,
   board_status) intact — only the streamed-in accumulation is reset."""
   agent.update({"steps": [], "final_report": "", "tokens": 0,
-                "started_at": None, "last_ts": None, "has_activity": False,
+                "spawned_tool_use_ids": [], "started_at": None,
+                "started_time_quality": "unknown", "ended_at": None,
+                "ended_time_quality": "unknown", "last_ts": None, "has_activity": False,
                 "final_report_terminal": None, "interrupted": False})
 
 
@@ -776,13 +873,16 @@ def _parse_codex_rollout(rollout: Path, model: dict, cursors: CursorStore,
       # it was spawned for rather than left blank.
       if spawn.get("label") and not session.get("spawn_label"):
         session["spawn_label"] = spawn["label"]
+      if spawn.get("depth") is not None:
+        session["spawn_depth"] = spawn["depth"]
       cursors.set(f"codex-sid::{rollout}", {"sid": sid})
     ts = rec.get("timestamp")
     if session and ts:
       _bump_activity(session, ts)
     if session and sid:
-      _fold_codex_collab(payload, sid, model)
-      _fold_codex_helper_activity(rtype, payload, sid, model)
+      _fold_codex_collab(payload, sid, model, ts)
+      _fold_codex_subagent_activity(payload, sid, model, ts)
+      _fold_codex_helper_activity(rtype, payload, sid, model, ts)
   if session is not None:
     _bump_activity(session, _mtime_iso(rollout))
 
@@ -809,6 +909,7 @@ def _codex_spawn_info(meta_payload: dict) -> dict:
   return {
     "parent_thread_id": spawn.get("parent_thread_id") or spawn.get("parentThreadId"),
     "label": label,
+    "depth": spawn.get("depth"),
   }
 
 
@@ -838,7 +939,27 @@ def _enforce_parent_invariant(model: dict) -> None:
   Remove that derived self-helper while preserving any real children in the same
   run. Invariant: a session is never its own parent.
   """
-  for sid, session in model.get("sessions", {}).items():
+  sessions = model.get("sessions", {})
+  agents = model.get("agents", {})
+  agent_ids = {str(agent.get("agent_id")) for agent in agents.values()
+               if agent.get("agent_id")}
+  # Codex records a child's parent *thread*. Convert a known top-level parent
+  # thread to the public main lane, retain a known helper parent, and never
+  # invent ancestry when the referenced rollout was not observed.
+  for agent in agents.values():
+    parent = str(agent.get("parent_agent_id") or "") or None
+    if not parent or parent == "main":
+      continue
+    parent_session = sessions.get(parent)
+    if parent_session is not None:
+      if parent_session.get("parent_thread_id"):
+        agent["parent_agent_id"] = parent if parent in agent_ids else None
+      else:
+        agent["parent_agent_id"] = "main"
+    elif parent not in agent_ids:
+      agent["parent_agent_id"] = None
+
+  for sid, session in sessions.items():
     if str(session.get("parent_thread_id") or "") != sid:
       continue
     session["parent_thread_id"] = None
@@ -867,7 +988,8 @@ def _looks_collab(payload: dict) -> bool:
   return bool(keys & camel) or bool(keys & snake)
 
 
-def _fold_codex_collab(payload: dict, sid: str, model: dict) -> None:
+def _fold_codex_collab(payload: dict, sid: str, model: dict,
+                       ts: Optional[str] = None) -> None:
   """A collab item names spawned agents in `agents_states` (thread_id -> state
   with status/model). Each becomes a helper under this session's collab run.
 
@@ -896,6 +1018,7 @@ def _fold_codex_collab(payload: dict, sid: str, model: dict) -> None:
     if not isinstance(state, dict):
       continue
     agent = _agent(model, sid, "collab", str(thread_id), "collab")
+    agent["parent_agent_id"] = sid
     agent["agent_type"] = str(state.get("model") or agent["agent_type"] or "codex")
     status = str(state.get("status", ""))
     # inProgress/completed/failed are the typed CollabAgentState values; map to
@@ -908,10 +1031,52 @@ def _fold_codex_collab(payload: dict, sid: str, model: dict) -> None:
       if state.get(field) and not agent["goal"]:
         agent["goal"] = str(state[field])
     agent["has_activity"] = True
+    if ts and not agent.get("started_at"):
+      agent["started_at"] = ts
+      agent["started_time_quality"] = "observed"
+
+
+def _fold_codex_subagent_activity(payload: dict, sid: str, model: dict,
+                                  record_ts: Optional[str]) -> None:
+  """Fold Codex's persisted per-child lifecycle marker.
+
+  Unlike the current live SDK's generic collab wait, the rollout marker carries
+  stable child identity plus a native event timestamp. It is therefore the
+  strongest historical start/interruption evidence available to the fallback.
+  """
+  ptype = str(payload.get("type") or "")
+  if ptype not in ("sub_agent_activity", "subAgentActivity"):
+    return
+  child_id = payload.get("agent_thread_id") or payload.get("agentThreadId")
+  if not child_id:
+    return
+  child_id = str(child_id)
+  agent = _agent(model, sid, "collab", child_id, "collab")
+  agent["agent_type"] = agent.get("agent_type") or "codex"
+  agent["parent_agent_id"] = sid
+  path = payload.get("agent_path") or payload.get("agentPath")
+  if path and not agent.get("goal"):
+    agent["goal"] = str(path).lstrip("/").replace("_", " ")
+  native_occurred = _coerce_iso(payload.get("occurred_at_ms")
+                                or payload.get("occurredAtMs"))
+  occurred = native_occurred or record_ts
+  quality = "exact" if native_occurred else "observed" if record_ts else "unknown"
+  kind = str(payload.get("kind") or "").lower()
+  if kind == "started":
+    if occurred and not agent.get("started_at"):
+      agent["started_at"] = occurred
+      agent["started_time_quality"] = quality
+    agent["has_activity"] = True
+  elif kind in ("interrupted", "stopped", "cancelled", "canceled"):
+    agent["interrupted"] = True
+    agent["has_activity"] = True
+    if occurred:
+      agent["ended_at"] = occurred
+      agent["ended_time_quality"] = quality
 
 
 def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
-                                model: dict) -> None:
+                                model: dict, ts: Optional[str] = None) -> None:
   """When THIS session is a collab/forked CHILD (has a parent), its own turn is
   a helper's transcript: record its function calls as steps and its last agent
   message as the report, on a synthetic self-agent under the parent's link.
@@ -925,6 +1090,16 @@ def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
       or str(session.get("parent_thread_id")) == sid):
     return
   agent = _agent(model, sid, "collab", sid, "collab")
+  agent["parent_agent_id"] = str(session["parent_thread_id"])
+  try:
+    agent["spawn_depth"] = max(1, int(session.get("spawn_depth") or 1))
+  except (TypeError, ValueError):
+    agent["spawn_depth"] = 1
+  if ts and not agent.get("started_at"):
+    agent["started_at"] = ts
+    agent["started_time_quality"] = "exact"
+  if ts:
+    agent["last_ts"] = ts
   if not agent["agent_type"]:
     agent["agent_type"] = "codex"
   if session.get("spawn_label") and not agent["goal"]:
@@ -948,10 +1123,28 @@ def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
     agent["final_report_terminal"] = True
     agent["interrupted"] = False
     agent["has_activity"] = True
+    agent["result"] = {"collab_status": "completed"}
+    completed_at = _coerce_iso(payload.get("completed_at")
+                               or payload.get("completedAt")) or ts
+    started_at = _coerce_iso(payload.get("started_at") or payload.get("startedAt"))
+    duration_ms = payload.get("duration_ms") or payload.get("durationMs")
+    if not started_at and completed_at and isinstance(duration_ms, (int, float)):
+      completed_epoch = _iso_to_epoch(completed_at)
+      if completed_epoch is not None and 0 <= float(duration_ms) < 365 * 24 * 3600 * 1000:
+        started_at = _epoch_to_iso(completed_epoch - float(duration_ms) / 1000)
+    if started_at:
+      agent["started_at"] = started_at
+      agent["started_time_quality"] = "exact"
+    if completed_at:
+      agent["ended_at"] = completed_at
+      agent["ended_time_quality"] = "exact"
   elif rtype == "event_msg" and payload.get("type") == "turn_aborted":
     agent["final_report_terminal"] = False
     agent["interrupted"] = True
     agent["has_activity"] = True
+    if ts:
+      agent["ended_at"] = ts
+      agent["ended_time_quality"] = "exact"
   elif rtype == "event_msg" and payload.get("type") == "user_message" and not agent["goal"]:
     agent["goal"] = str(payload.get("text") or payload.get("message") or "")
 
@@ -1091,6 +1284,298 @@ def fetch_chats(base_url: str, token: str) -> tuple[bool, dict[str, dict]]:
         "activity_at": c.get("activity_at") or c.get("updated_at"),
       }
   return True, out
+
+
+LIFECYCLE_PAGE_LIMIT = 1000
+LIFECYCLE_MAX_PAGES = 20
+LIFECYCLE_CACHE_SCHEMA = 3
+_LIFECYCLE_TYPES = {"agent_spawned", "agent_started", "agent_terminal"}
+_LIFECYCLE_STATES = {"running", "done", "failed", "stopped"}
+_TIME_QUALITIES = {"exact", "observed", "estimated", "unknown"}
+
+
+def _bounded_lifecycle_id(value, *, storage_key: bool = False) -> Optional[str]:
+  """Bound opaque API identities; storage-key ids may not alter URL paths."""
+  if value is None:
+    return None
+  result = str(value)
+  if not result or len(result.encode("utf-8", "replace")) > 256:
+    return None
+  if storage_key and (result in (".", "..") or "/" in result or "\\" in result
+                      or any(ord(char) < 32 for char in result)):
+    return None
+  return result
+
+
+def _lifecycle_iso(value) -> Optional[str]:
+  result = _coerce_iso(value)
+  return result if _iso_to_epoch(result) is not None else None
+
+
+def _normalized_lifecycle_event(raw: dict) -> Optional[dict]:
+  """Validate and bound one owner lifecycle API event.
+
+  Unknown event types are ignored for forward compatibility. Identity and
+  chronology fields remain structural; arbitrary provider payloads and prompts
+  are never copied into app state.
+  """
+  if not isinstance(raw, dict):
+    return None
+  chat_id = _bounded_lifecycle_id(raw.get("chat_id"), storage_key=True)
+  logical_agent_id = _bounded_lifecycle_id(raw.get("agent_id"), storage_key=True)
+  agent_id = _bounded_lifecycle_id(
+    raw.get("agent_run_id") or raw.get("agent_id"), storage_key=True)
+  if not chat_id or not agent_id or not logical_agent_id:
+    return None
+  raw_type = str(raw.get("type") or "").replace(".", "_")
+  aliases = {
+    "agent_completed": "agent_terminal", "agent_failed": "agent_terminal",
+    "agent_stopped": "agent_terminal", "agent_interrupted": "agent_terminal",
+  }
+  event_type = aliases.get(raw_type, raw_type)
+  if event_type not in _LIFECYCLE_TYPES:
+    return None
+  state = str(raw.get("state") or "").lower()
+  if event_type == "agent_terminal" and state not in _LIFECYCLE_STATES - {"running"}:
+    return None
+  if event_type != "agent_terminal":
+    state = "running"
+  try:
+    seq = int(raw.get("id"))
+  except (TypeError, ValueError):
+    return None
+  if seq < 0:
+    return None
+  event_key = str(raw.get("event_key") or raw.get("source_event_id") or f"row:{seq}")
+  digest = hashlib.sha256(event_key.encode("utf-8", "replace")).hexdigest()[:24]
+  quality = str(raw.get("time_quality") or "unknown").lower()
+  if quality not in _TIME_QUALITIES:
+    quality = "unknown"
+  occurred = _lifecycle_iso(raw.get("occurred_at"))
+  observed = _lifecycle_iso(raw.get("observed_at"))
+  if quality == "exact" and not occurred:
+    quality = "observed" if observed else "unknown"
+  elif quality == "observed" and not (occurred or observed):
+    quality = "unknown"
+  parent_kind = str(raw.get("parent_kind") or (
+    "agent" if raw.get("parent_agent_id") else "unknown"))
+  return {
+    "id": seq, "event_id": f"platform-{digest}",
+    "chat_id": chat_id,
+    "chat_run_id": _bounded_lifecycle_id(raw.get("chat_run_id")),
+    "provider": clip_line(str(raw.get("provider") or ""), 32),
+    "provider_session_id": _bounded_lifecycle_id(raw.get("provider_session_id")),
+    "agent_id": agent_id,
+    "logical_agent_id": logical_agent_id,
+    "provider_agent_id": _bounded_lifecycle_id(raw.get("provider_agent_id")),
+    "parent_agent_id": (
+      "main" if parent_kind == "main" else
+      _bounded_lifecycle_id(
+        raw.get("parent_agent_run_id") or raw.get("parent_agent_id"))
+      if parent_kind == "agent" else None
+    ),
+    "parent_kind": parent_kind,
+    "parent_source_id": _bounded_lifecycle_id(raw.get("parent_source_id")),
+    "type": event_type, "state": state,
+    "agent_type": clip_line(str(raw.get("agent_type") or ""), 48),
+    "summary": clip_line(str(raw.get("summary") or ""), OUTCOME_CAP),
+    "occurred_at": occurred, "observed_at": observed,
+    "time_quality": quality,
+    "source": clip_line(str(raw.get("source") or "platform"), 32),
+    "source_event_id": _bounded_lifecycle_id(raw.get("source_event_id")),
+  }
+
+
+def _normalized_lifecycle_run(raw: dict) -> Optional[dict]:
+  if not isinstance(raw, dict):
+    return None
+  run_id = _bounded_lifecycle_id(raw.get("id"))
+  chat_id = _bounded_lifecycle_id(raw.get("chat_id"), storage_key=True)
+  if not run_id or not chat_id:
+    return None
+  status = str(raw.get("status") or "").lower()
+  try:
+    update_id = max(0, int(raw.get("update_id") or 0))
+  except (TypeError, ValueError):
+    return None
+  return {
+    "id": run_id, "chat_id": chat_id,
+    "update_id": update_id,
+    "provider": clip_line(str(raw.get("provider") or ""), 32),
+    "status": status,
+    "started_at": _lifecycle_iso(raw.get("started_at")),
+    "ended_at": _lifecycle_iso(raw.get("ended_at")),
+  }
+
+
+def fetch_agent_lifecycle(base_url: str, token: str, after_id: int = 0,
+                          runs_after_id: int = 0,
+                          max_pages: int = LIFECYCLE_MAX_PAGES,
+                          chat_id: Optional[str] = None,
+                          ) -> tuple[bool, bool, list[dict], list[dict], int, int]:
+  """Fetch new platform lifecycle pages.
+
+  Returns ``(ok, supported, events, runs, event_cursor, run_cursor)``. A 404 means an
+  older platform and is a healthy, unsupported result; every other failed or
+  malformed page leaves the caller's last-good cache untouched.
+  """
+  cursor = max(0, int(after_id or 0))
+  run_cursor = max(0, int(runs_after_id or 0))
+  events: list[dict] = []
+  runs_by_id: dict[str, dict] = {}
+  for page_index in range(max_pages):
+    path = (f"/api/chats/agent-lifecycle?after_id={cursor}"
+            f"&runs_after_id={run_cursor}"
+            f"&limit={LIFECYCLE_PAGE_LIMIT}&run_limit={LIFECYCLE_PAGE_LIMIT}")
+    if chat_id is not None:
+      path += "&chat_id=" + urllib.parse.quote(chat_id, safe="")
+    status, data = _api_get_json(base_url, path, token)
+    if status == 404:
+      return True, False, [], [], cursor, run_cursor
+    if status != 200 or not isinstance(data, dict):
+      return False, True, [], [], after_id, runs_after_id
+    page = data.get("events")
+    runs = data.get("runs")
+    if not isinstance(page, list) or not isinstance(runs, list):
+      return False, True, [], [], after_id, runs_after_id
+    page_events: list[Optional[dict]] = []
+    for row in page:
+      if not isinstance(row, dict):
+        return False, True, [], [], after_id, runs_after_id
+      raw_type = str(row.get("type") or "").replace(".", "_")
+      if raw_type not in (_LIFECYCLE_TYPES | {
+          "agent_completed", "agent_failed", "agent_stopped", "agent_interrupted"}):
+        continue  # additive future event type
+      page_events.append(_normalized_lifecycle_event(row))
+    if any(row is None for row in page_events):
+      return False, True, [], [], after_id, runs_after_id
+    events.extend(row for row in page_events if row is not None)
+    for raw_run in runs:
+      run = _normalized_lifecycle_run(raw_run)
+      if run is None:
+        return False, True, [], [], after_id, runs_after_id
+      runs_by_id[run["id"]] = run
+    try:
+      next_cursor = int(data.get("next_after_id", cursor))
+      next_run_cursor = int(data.get("next_runs_after_id", run_cursor))
+    except (TypeError, ValueError):
+      return False, True, [], [], after_id, runs_after_id
+    if (next_cursor < cursor or next_run_cursor < run_cursor
+        or (data.get("has_more") and next_cursor == cursor)
+        or (data.get("runs_has_more") and next_run_cursor == run_cursor)):
+      return False, True, [], [], after_id, runs_after_id
+    cursor = next_cursor
+    run_cursor = next_run_cursor
+    if not data.get("has_more") and not data.get("runs_has_more"):
+      return True, True, events, list(runs_by_id.values()), cursor, run_cursor
+  # A bounded invocation may stop mid-backfill. The returned cursor/events are a
+  # complete prefix and safe to commit; the next refresh continues from there.
+  return True, True, events, list(runs_by_id.values()), cursor, run_cursor
+
+
+def merge_lifecycle_state(state, events: list[dict], runs: list[dict],
+                          cursor: int, *, runs_cursor: Optional[int] = None,
+                          preferred_chat_ids: Iterable[str] = (),
+                          pinned_chat_ids: Iterable[str] = (),
+                          count_new_events: bool = True) -> dict:
+  """Idempotently fold one API prefix into the persisted last-good cache.
+
+  Scoped recovery can legitimately replay IDs older than the global tail. The
+  cache therefore prefers the current owner roster instead of blindly keeping
+  only the numerically newest IDs, and records total ingested facts separately
+  so any cache-level omission remains visible in the published contract.
+  """
+  base = state if isinstance(state, dict) else {}
+  by_event = {str(row.get("event_id")): row for row in base.get("events", [])
+              if isinstance(row, dict) and row.get("event_id")}
+  for event in events:
+    by_event[event["event_id"]] = event
+  by_run = {str(row.get("id")): row for row in base.get("runs", [])
+            if isinstance(row, dict) and row.get("id")}
+  for run in runs:
+    if run.get("status") == "deleted":
+      by_run.pop(run["id"], None)
+    else:
+      by_run[run["id"]] = run
+  try:
+    base_cursor = max(0, int(base.get("after_id") or 0))
+  except (TypeError, ValueError):
+    base_cursor = 0
+  try:
+    new_cursor = max(0, int(cursor or 0))
+  except (TypeError, ValueError):
+    new_cursor = base_cursor
+  try:
+    base_runs_cursor = max(0, int(base.get("runs_after_id") or 0))
+  except (TypeError, ValueError):
+    base_runs_cursor = 0
+  try:
+    new_runs_cursor = max(0, int(runs_cursor or 0)) if runs_cursor is not None else base_runs_cursor
+  except (TypeError, ValueError):
+    new_runs_cursor = base_runs_cursor
+  seen_by_chat: dict[str, int] = {}
+  raw_seen = base.get("events_seen_by_chat")
+  if isinstance(raw_seen, dict):
+    for chat_id, count in raw_seen.items():
+      if not isinstance(chat_id, str) or not chat_id:
+        continue
+      try:
+        seen_by_chat[chat_id] = max(0, int(count or 0))
+      except (TypeError, ValueError):
+        continue
+  if count_new_events:
+    for event in events:
+      # Global cursor pages never replay an ID. Restrict the accounting to the
+      # newly consumed suffix so a scoped snapshot cannot double-count facts.
+      if int(event.get("id") or 0) <= base_cursor:
+        continue
+      chat_id = str(event.get("chat_id") or "")
+      if chat_id:
+        seen_by_chat[chat_id] = seen_by_chat.get(chat_id, 0) + 1
+
+  preferred = {str(chat_id) for chat_id in preferred_chat_ids if chat_id}
+  pinned = {str(chat_id) for chat_id in pinned_chat_ids if chat_id}
+  per_chat: dict[str, list[dict]] = {}
+  for event in by_event.values():
+    per_chat.setdefault(str(event.get("chat_id") or ""), []).append(event)
+  bounded_events: list[dict] = []
+  for chat_events in per_chat.values():
+    chat_events.sort(key=lambda row: (row.get("id", 0), row["event_id"]))
+    bounded_events.extend(chat_events[-MAX_LIFECYCLE_CACHE_EVENTS_PER_CHAT:])
+  retained_events = sorted(bounded_events, key=lambda row: (
+    2 if str(row.get("chat_id") or "") in pinned else
+    1 if str(row.get("chat_id") or "") in preferred else 0,
+    row.get("id", 0), row["event_id"],
+  ))[-MAX_LIFECYCLE_CACHE_EVENTS:]
+  retained_events.sort(key=lambda row: (row.get("id", 0), row["event_id"]))
+  retained_runs = sorted(by_run.values(), key=lambda row: (
+    2 if str(row.get("chat_id") or "") in pinned else
+    1 if str(row.get("chat_id") or "") in preferred else 0,
+    _iso_to_epoch(row.get("started_at")) or float("-inf"), row["id"],
+  ))[-MAX_LIFECYCLE_CACHE_RUNS:]
+  retained_runs.sort(key=lambda row: (
+    _iso_to_epoch(row.get("started_at")) or float("-inf"), row["id"]))
+  known_chat_ids = {
+    str(chat_id) for chat_id in base.get("known_lifecycle_chat_ids", [])
+    if isinstance(chat_id, str) and chat_id
+  }
+  known_chat_ids.update(str(row.get("chat_id")) for row in events
+                        if row.get("chat_id"))
+  return {
+    # Bump this schema whenever the parser learns a lifecycle event type. A
+    # mismatch resets the cursor in run_refresh, making additive platform rows
+    # replayable without retaining arbitrary unknown provider payloads here.
+    "schema": LIFECYCLE_CACHE_SCHEMA, "after_id": max(base_cursor, new_cursor),
+    "runs_after_id": max(base_runs_cursor, new_runs_cursor),
+    "events": retained_events,
+    "runs": retained_runs,
+    "events_seen_by_chat": seen_by_chat,
+    "known_lifecycle_chat_ids": sorted(known_chat_ids),
+    "visible_chat_ids": sorted({
+      str(chat_id) for chat_id in base.get("visible_chat_ids", [])
+      if isinstance(chat_id, str) and chat_id
+    }),
+  }
 
 
 # The tool block a chat records when it spawns a background helper. The name
@@ -1312,6 +1797,8 @@ def helper_from_agent_block(block: dict, ordinal: int = 0,
     "_brief_full": clip_markdown(prompt, FULL_PROMPT_CAP) or "",
     # A launch hint only; joined terminal evidence supersedes it later.
     "is_async": is_async,
+    "_tool_use_id": str(block.get("tool_use_id") or "") or None,
+    "_spawned_at": None,
   }
 
 
@@ -1450,6 +1937,8 @@ def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]
             continue
           handback = _handback(blocks, index)
           record["_handback"] = handback
+          record["_spawned_at"] = msg.get("ts") if isinstance(
+            msg.get("ts"), (int, float, str)) else last_user_ts
           helpers.append(record)
           agent_ids.append(str(record["agent_id"]))
         else:
@@ -1901,7 +2390,28 @@ def _trace_evidence(agent: dict, now: float, provider: str) -> dict:
     "depth": max(1, int(agent.get("spawn_depth") or 1)),
     "tools": tools, "next": "", "provider": provider, "origin": "trace",
     "ts": agent.get("started_at") or agent.get("last_ts"),
+    "parent_agent_id": agent.get("parent_agent_id"),
+    "started_at": agent.get("started_at"),
+    "started_time_quality": agent.get("started_time_quality") or "unknown",
+    "ended_at": agent.get("ended_at"),
+    "ended_time_quality": agent.get("ended_time_quality") or "unknown",
+    "last_activity_at": agent.get("last_ts"),
+    # Timeline state deliberately ignores freshness. A trace with activity but
+    # no terminal marker is unresolved, not proof that a process is still live.
+    "lifecycle_state": _trace_lifecycle_state(agent),
   }
+
+
+def _trace_lifecycle_state(agent: dict) -> str:
+  if agent.get("board_status") == "failed" or _result_is_failure(agent.get("result")):
+    return "failed"
+  if _result_is_success(agent.get("result")):
+    return "done"
+  if _result_is_stopped(agent.get("result")) or agent.get("interrupted"):
+    return "stopped"
+  if agent.get("final_report_terminal") is True:
+    return "done"
+  return "unknown"
 
 
 def _next_from_handback(handback: dict) -> str:
@@ -1938,6 +2448,13 @@ def _block_evidence(helper: dict, provider: str) -> dict:
     "report_full": "" if is_async else report,
     "tools": [], "next": _next_from_handback(helper.get("_handback") or {}),
     "provider": provider, "origin": "block", "ts": None, "depth": None,
+    "parent_agent_id": "main",
+    "started_at": _coerce_iso(helper.get("_spawned_at")),
+    "started_time_quality": ("observed" if helper.get("_spawned_at") is not None
+                             else "unknown"),
+    "ended_at": None, "ended_time_quality": "unknown",
+    "last_activity_at": _coerce_iso(helper.get("_spawned_at")),
+    "lifecycle_state": ("unknown" if state == "running" else state),
   }
 
 
@@ -1997,6 +2514,18 @@ def _merge_evidence(records: list[dict], provider: str) -> dict:
             if isinstance(r.get("depth"), int) and r["depth"] > 0]
   kind, name = _kind_and_name(types[0] if types else "", provider)
   did = _did_from_tools(tools)
+  def _best_time(field: str, quality_field: str) -> tuple[Optional[str], str]:
+    rank = {"unknown": 0, "estimated": 1, "observed": 2, "exact": 3}
+    candidates = [(r.get(field), str(r.get(quality_field) or "unknown"))
+                  for r in records if r.get(field)]
+    if not candidates:
+      return None, "unknown"
+    return max(candidates, key=lambda item: rank.get(item[1], 0))
+  started_at, started_quality = _best_time("started_at", "started_time_quality")
+  ended_at, ended_quality = _best_time("ended_at", "ended_time_quality")
+  lifecycle_states = [str(r.get("lifecycle_state") or "unknown") for r in records]
+  lifecycle_state = _resolved_timeline_state(lifecycle_states)
+  parents = [str(r["parent_agent_id"]) for r in records if r.get("parent_agent_id")]
   return {
     "agent_id": records[0]["agent_id"], "kind": kind, "name": name,
     "ask": asks[0] if asks else "No brief was recorded",
@@ -2008,7 +2537,26 @@ def _merge_evidence(records: list[dict], provider: str) -> dict:
     "next": next_lines[-1] if next_lines else "",
     "commands": _commands_from_tools(tools), "_tools": tools,
     "ts": next((r.get("ts") for r in records if r.get("ts")), None),
+    "provider": provider, "parent_agent_id": parents[0] if parents else None,
+    "started_at": started_at, "started_time_quality": started_quality,
+    "ended_at": ended_at, "ended_time_quality": ended_quality,
+    "last_activity_at": next((r.get("last_activity_at") for r in records
+                              if r.get("last_activity_at")), None),
+    "lifecycle_state": lifecycle_state,
   }
+
+
+def _resolved_timeline_state(states: Iterable[str]) -> str:
+  values = {str(state or "unknown").lower() for state in states}
+  if "failed" in values:
+    return "failed"
+  if "done" in values:
+    return "done"
+  if values & {"stopped", "cancelled", "interrupted"}:
+    return "stopped"
+  if "running" in values:
+    return "running"
+  return "unknown"
 
 
 def _owner_noun(parts: Iterable[str]) -> str:
@@ -2282,7 +2830,7 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
   public_subs = [{
     "agent_id": sub["agent_id"], "kind": sub["kind"], "name": sub["name"],
     "ask": sub["ask"], "state": sub["state"], "depth": sub["depth"],
-    "prompt_available": True,
+    "prompt_available": bool(sub.get("brief_full")),
   } for sub in subs]
   return {
     "outcome": clip_line(outcome, OUTCOME_CAP), "area": area,
@@ -2346,16 +2894,405 @@ def _chat_status(turns: list[dict]) -> tuple[str, str]:
   return turns[-1]["status"], turns[-1]["result"]
 
 
+def _event_time_key(event: dict) -> tuple[float, int, str]:
+  occurred = _iso_to_epoch(event.get("occurred_at"))
+  observed = _iso_to_epoch(event.get("observed_at"))
+  return (occurred if occurred is not None else
+          observed if observed is not None else float("inf"),
+          int(event.get("source_order") or event.get("id") or 0),
+          str(event.get("event_id") or ""))
+
+
+def _ordered_timeline_events(events: list[dict], parent_by_agent: dict[str, Optional[str]]) -> list[dict]:
+  """Stable ``O(E log E)`` causal order for out-of-order observations."""
+  unique: dict[str, dict] = {}
+  semantic: set[tuple] = set()
+  for event in events:
+    event_id = str(event.get("event_id") or "")
+    if not event_id or event_id in unique:
+      continue
+    sig = (event.get("subject_agent_id"), event.get("type"), event.get("state"),
+           event.get("occurred_at"), event.get("source_event_id"),
+           event.get("summary"))
+    if sig in semantic:
+      continue
+    semantic.add(sig)
+    unique[event_id] = event
+  rows = list(unique.values())
+  by_agent: dict[str, list[int]] = {}
+  for i, row in enumerate(rows):
+    if row.get("subject_agent_id"):
+      by_agent.setdefault(str(row["subject_agent_id"]), []).append(i)
+  deps: list[set[int]] = [set() for _ in rows]
+  dependents: list[set[int]] = [set() for _ in rows]
+  stage = {"agent_spawned": 0, "agent_started": 1, "agent_terminal": 2}
+  for indexes in by_agent.values():
+    # One chain is enough to enforce stage causality; connecting every pair is
+    # quadratic and adds no ordering information.
+    chain = sorted(indexes, key=lambda i: (
+      stage.get(rows[i].get("type"), 1), _event_time_key(rows[i])))
+    for earlier, later in zip(chain, chain[1:]):
+      deps[later].add(earlier)
+  for child, parent in parent_by_agent.items():
+    if not parent or parent == "main" or parent not in by_agent or child not in by_agent:
+      continue
+    parent_starts = [i for i in by_agent[parent]
+                     if rows[i].get("type") in ("agent_spawned", "agent_started")]
+    child_starts = [i for i in by_agent[child]
+                    if rows[i].get("type") in ("agent_spawned", "agent_started")]
+    if parent_starts:
+      parent_start = min(parent_starts, key=lambda i: _event_time_key(rows[i]))
+      for child_start in child_starts:
+        deps[child_start].add(parent_start)
+  for later, requirements in enumerate(deps):
+    for earlier in requirements:
+      dependents[earlier].add(later)
+  ordered: list[dict] = []
+  indegree = [len(requirements) for requirements in deps]
+  ready = [(_event_time_key(rows[i]), i) for i, degree in enumerate(indegree)
+           if degree == 0]
+  heapq.heapify(ready)
+  emitted: set[int] = set()
+  while ready:
+    _, chosen = heapq.heappop(ready)
+    if chosen in emitted:
+      continue
+    emitted.add(chosen)
+    public = dict(rows[chosen])
+    public["order"] = len(ordered)
+    public.pop("id", None)
+    public.pop("source_order", None)
+    public.pop("source_event_id", None)
+    ordered.append(public)
+    for later in dependents[chosen]:
+      indegree[later] -= 1
+      if indegree[later] == 0:
+        heapq.heappush(ready, (_event_time_key(rows[later]), later))
+  if len(emitted) != len(rows):
+    # Corrupt/cyclic ancestry cannot wedge the digest. Emit the remainder in a
+    # deterministic time order and retain the fact that it existed.
+    for chosen in sorted(set(range(len(rows))) - emitted,
+                         key=lambda i: _event_time_key(rows[i])):
+      public = dict(rows[chosen])
+      public["order"] = len(ordered)
+      public.pop("id", None)
+      public.pop("source_order", None)
+      public.pop("source_event_id", None)
+      ordered.append(public)
+  return ordered
+
+
+def _timeline_event(event_id: str, event_type: str, subject: str,
+                    actor: Optional[str], state: Optional[str],
+                    occurred_at: Optional[str], observed_at: Optional[str],
+                    quality: str, summary: str = "", source_order: int = 0,
+                    source_event_id: Optional[str] = None,
+                    chat_run_id: Optional[str] = None) -> dict:
+  return {
+    "event_id": event_id, "type": event_type,
+    "occurred_at": occurred_at, "observed_at": observed_at,
+    "time_quality": quality if quality in _TIME_QUALITIES else "unknown",
+    "actor_agent_id": actor, "subject_agent_id": subject,
+    "state": state, "summary": clip_line(summary, OUTCOME_CAP),
+    "chat_run_id": chat_run_id, "source_order": source_order,
+    "source_event_id": source_event_id,
+  }
+
+
+def _platform_overlay(merged: dict[str, dict], events: list[dict], provider: str
+                      ) -> dict[str, str]:
+  """Apply authoritative platform lifecycle state to trace metadata in-place.
+
+  Returns provider/native id -> public opaque id aliases used to rewrite owner
+  turn references. Prompt/report metadata remains trace-derived; only lifecycle
+  identity, parentage, timing and state are replaced.
+  """
+  aliases: dict[str, str] = {}
+  grouped: dict[str, list[dict]] = {}
+  for event in events:
+    grouped.setdefault(event["agent_id"], []).append(event)
+  for public_id, agent_events in grouped.items():
+    native_ids = [e.get("provider_agent_id") for e in agent_events
+                  if e.get("provider_agent_id")]
+    native = native_ids[0] if native_ids else public_id
+    helper = merged.get(native) or merged.get(public_id)
+    if (helper is not None and helper.get("_platform_activation_id")
+        and helper.get("_platform_activation_id") != public_id):
+      helper = dict(helper)
+      merged[f"platform:{public_id}"] = helper
+    if helper is None:
+      agent_type = next((e.get("agent_type") for e in agent_events
+                         if e.get("agent_type")), "")
+      kind, name = _kind_and_name(agent_type, provider)
+      helper = {
+        "agent_id": public_id, "kind": kind, "name": name,
+        "ask": next((e.get("summary") for e in agent_events if e.get("summary")),
+                    "No brief was recorded"),
+        "state": "unknown", "brief_full": "", "depth": 1,
+        "result": "", "_tools": [], "provider": provider,
+        "started_at": None, "started_time_quality": "unknown",
+        "ended_at": None, "ended_time_quality": "unknown",
+        "last_activity_at": None, "parent_agent_id": None,
+        "prompt_available": False,
+      }
+      merged[f"platform:{public_id}"] = helper
+    helper["agent_id"] = public_id
+    helper["_platform_activation_id"] = public_id
+    helper["chat_run_id"] = next((event.get("chat_run_id") for event in
+                                   reversed(sorted(agent_events,
+                                                   key=lambda row: row["id"]))
+                                   if event.get("chat_run_id")), None)
+    aliases[str(native)] = public_id
+    terminal_seen = False
+    for event in sorted(agent_events, key=lambda row: row["id"]):
+      if event.get("parent_agent_id") and event["parent_agent_id"] != public_id:
+        helper["parent_agent_id"] = event["parent_agent_id"]
+      if event.get("summary"):
+        helper["ask"] = helper.get("ask") or event["summary"]
+      when = event.get("occurred_at") or event.get("observed_at")
+      if event["type"] in ("agent_spawned", "agent_started"):
+        if not helper.get("started_at") or event["time_quality"] == "exact":
+          helper["started_at"] = when
+          helper["started_time_quality"] = event["time_quality"]
+        # Start-only platform evidence is not a contradiction of an explicit
+        # trace terminal. This matters for Codex, whose current SDK persists
+        # starts/interruption but has no positive completion notification.
+        if (not terminal_seen
+            and helper.get("lifecycle_state") not in ("done", "failed", "stopped")):
+          helper["lifecycle_state"] = helper["state"] = "running"
+      elif event["type"] == "agent_terminal":
+        terminal_seen = True
+        helper["lifecycle_state"] = helper["state"] = event["state"]
+        helper["ended_at"] = when
+        helper["ended_time_quality"] = event["time_quality"]
+        if event.get("summary"):
+          helper["result"] = event["summary"]
+      helper["last_activity_at"] = when or event.get("observed_at")
+    terminals = [event for event in agent_events
+                 if event.get("type") == "agent_terminal"]
+    if terminals:
+      resolved_terminal = _resolved_timeline_state(
+        event.get("state") for event in terminals)
+      helper["lifecycle_state"] = helper["state"] = resolved_terminal
+      matching = [event for event in terminals
+                  if event.get("state") == resolved_terminal] or terminals
+      chosen_terminal = max(matching, key=lambda row: row.get("id", 0))
+      helper["ended_at"] = (chosen_terminal.get("occurred_at")
+                            or chosen_terminal.get("observed_at"))
+      helper["ended_time_quality"] = chosen_terminal.get("time_quality") or "unknown"
+      if chosen_terminal.get("summary"):
+        helper["result"] = chosen_terminal["summary"]
+    started_epoch = _iso_to_epoch(helper.get("started_at"))
+    ended_epoch = _iso_to_epoch(helper.get("ended_at"))
+    if (started_epoch is not None and ended_epoch is not None
+        and started_epoch > ended_epoch):
+      # Preserve the raw events, but do not publish an impossible aggregate
+      # duration when provider clocks or replay order conflict.
+      helper["started_at"] = None
+      helper["started_time_quality"] = "unknown"
+      helper["timing_conflict"] = True
+  for helper in merged.values():
+    parent = helper.get("parent_agent_id")
+    if parent in aliases:
+      helper["parent_agent_id"] = aliases[parent]
+  return aliases
+
+
+def _sanitize_timeline_parents(agents: list[dict]) -> dict[str, Optional[str]]:
+  ids = {str(agent["agent_id"]) for agent in agents}
+  parent_map: dict[str, Optional[str]] = {}
+  for agent in agents:
+    aid = str(agent["agent_id"])
+    parent = str(agent.get("parent_agent_id") or "") or None
+    if parent not in ids and parent != "main":
+      parent = None
+    if parent == aid:
+      parent = None
+    parent_map[aid] = parent
+  # Break cycles without inventing a replacement edge.
+  for aid in list(parent_map):
+    seen: set[str] = set()
+    cur = aid
+    while cur and cur != "main" and cur in parent_map:
+      if cur in seen:
+        parent_map[aid] = None
+        break
+      seen.add(cur)
+      cur = parent_map.get(cur)
+  return parent_map
+
+
+def _retain_recent_helpers(merged: dict[str, dict]) -> tuple[dict[str, dict], int]:
+  """Bound one chat by latest observed helper activity, deterministically."""
+  if len(merged) <= MAX_TIMELINE_AGENTS:
+    return merged, 0
+  ranked: list[tuple[float, int, str]] = []
+  for insertion, (key, helper) in enumerate(merged.items()):
+    timestamps = (
+      helper.get("last_activity_at"), helper.get("ended_at"),
+      helper.get("started_at"), helper.get("ts"),
+    )
+    activity = max((_iso_to_epoch(value) for value in timestamps), default=None,
+                   key=lambda value: value if value is not None else float("-inf"))
+    ranked.append((activity if activity is not None else float("-inf"), insertion, key))
+  keep = {key for _, _, key in sorted(ranked)[-MAX_TIMELINE_AGENTS:]}
+  return ({key: helper for key, helper in merged.items() if key in keep},
+          len(merged) - len(keep))
+
+
+def _compact_public_timeline_events(events: list[dict]) -> tuple[list[dict], int]:
+  """Keep only the milestones needed by the skim-first timeline.
+
+  Provider wrappers may report the same activation many times. The visual
+  contract intentionally needs at most one spawn, one start and the resolved
+  terminal per helper, plus the already-bounded owner checkpoints.
+  """
+  checkpoints = [event for event in events if event.get("type") == "main_checkpoint"]
+  by_agent: dict[str, list[dict]] = {}
+  for event in events:
+    if event.get("type") == "main_checkpoint":
+      continue
+    subject = str(event.get("subject_agent_id") or "")
+    if subject:
+      by_agent.setdefault(subject, []).append(event)
+  retained = checkpoints[-40:]
+  for agent_events in by_agent.values():
+    for milestone in ("agent_spawned", "agent_started"):
+      candidates = [event for event in agent_events if event.get("type") == milestone]
+      if candidates:
+        retained.append(min(candidates, key=_event_time_key))
+    terminals = [event for event in agent_events
+                 if event.get("type") == "agent_terminal"]
+    if terminals:
+      resolved = _resolved_timeline_state(
+        event.get("state") for event in terminals)
+      matching = [event for event in terminals if event.get("state") == resolved]
+      retained.append(max(matching or terminals, key=lambda event: (
+        int(event.get("source_order") or event.get("id") or 0),
+        _event_time_key(event))))
+  if len(retained) > MAX_TIMELINE_EVENTS_PER_CHAT:
+    retained = sorted(retained, key=_event_time_key)[-MAX_TIMELINE_EVENTS_PER_CHAT:]
+  return retained, max(0, len(events) - len(retained))
+
+
+def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
+                    platform_events: list[dict], platform_runs: list[dict],
+                    turns: list[dict], agents_omitted: int = 0,
+                    events_omitted: int = 0) -> dict:
+  agents: list[dict] = []
+  seen: set[str] = set()
+  for helper in merged.values():
+    aid = str(helper["agent_id"])
+    if aid in seen:
+      continue
+    seen.add(aid)
+    agents.append({
+      "agent_id": aid, "parent_agent_id": helper.get("parent_agent_id"),
+      "chat_run_id": helper.get("chat_run_id"),
+      "provider": helper.get("provider") or provider,
+      "kind": helper.get("kind") or "general", "name": helper.get("name") or "Helper",
+      "task_summary": helper.get("ask") or "No brief was recorded",
+      "state": helper.get("lifecycle_state") or "unknown",
+      "prompt_available": bool(helper.get("brief_full")),
+      "outcome_summary": helper.get("result") or "",
+      "started_at": helper.get("started_at"), "ended_at": helper.get("ended_at"),
+      "start_time_quality": helper.get("started_time_quality") or "unknown",
+      "end_time_quality": helper.get("ended_time_quality") or "unknown",
+      "last_activity_at": helper.get("last_activity_at"),
+      "timing_conflict": bool(helper.get("timing_conflict")),
+    })
+  parent_map = _sanitize_timeline_parents(agents)
+  for agent in agents:
+    agent["parent_agent_id"] = parent_map[agent["agent_id"]]
+
+  public_events: list[dict] = []
+  platform_subjects = {event["agent_id"] for event in platform_events}
+  for event in platform_events:
+    actor = event.get("parent_agent_id")
+    public_events.append(_timeline_event(
+      event["event_id"], event["type"], event["agent_id"], actor,
+      event.get("state"), event.get("occurred_at"), event.get("observed_at"),
+      event.get("time_quality") or "unknown", event.get("summary") or "",
+      source_order=event.get("id") or 0,
+      source_event_id=event.get("source_event_id"),
+      chat_run_id=event.get("chat_run_id")))
+  for helper in merged.values():
+    aid = str(helper["agent_id"])
+    if aid in platform_subjects:
+      continue
+    parent = parent_map.get(aid)
+    start = helper.get("started_at")
+    start_quality = helper.get("started_time_quality") or "unknown"
+    event_seed = f"trace:{chat_id}:{aid}"
+    public_events.append(_timeline_event(
+      event_seed + ":start", "agent_started" if start else "agent_spawned",
+      aid, parent, "running" if start else None, start,
+      helper.get("last_activity_at") if not start else start,
+      start_quality, helper.get("ask") or ""))
+    state = helper.get("lifecycle_state") or "unknown"
+    if state in ("done", "failed", "stopped"):
+      public_events.append(_timeline_event(
+        event_seed + ":terminal", "agent_terminal", aid, aid, state,
+        helper.get("ended_at"), helper.get("last_activity_at"),
+        helper.get("ended_time_quality") or "unknown", helper.get("result") or ""))
+  # Owner turns are first-class checkpoints on the same time axis. Keeping
+  # these in the canonical event stream means every renderer gets correct
+  # interleaving instead of appending a second, visually misleading sequence.
+  for index, turn in enumerate(turns):
+    when = turn.get("ts")
+    public_events.append(_timeline_event(
+      f"main:{chat_id}:checkpoint:{index}", "main_checkpoint", "main", "main",
+      turn.get("status"), when, when, "exact" if when else "unknown",
+      turn.get("outcome") or "", source_order=index))
+  main_runs = [dict(run, start_time_quality="exact" if run.get("started_at") else "unknown",
+                    end_time_quality="exact" if run.get("ended_at") else "unknown")
+               for run in platform_runs[-MAX_MAIN_RUNS_PER_CHAT:]]
+  if not main_runs:
+    first_ts = next((turn.get("ts") for turn in turns if turn.get("ts")), None)
+    status, _ = _chat_status(turns)
+    main_runs = [{
+      "id": f"fallback:{chat_id}", "chat_id": chat_id, "provider": provider,
+      "status": "running" if status == "running" else "unknown",
+      "started_at": first_ts, "ended_at": None,
+      "start_time_quality": "observed" if first_ts else "unknown",
+      "end_time_quality": "unknown",
+    }]
+  public_events, compacted_events = _compact_public_timeline_events(public_events)
+  return {
+    "main_agent_id": "main", "main_runs": main_runs,
+    "agents": agents,
+    "events": _ordered_timeline_events(public_events, parent_map),
+    "retention": {
+      "agents_omitted": max(0, int(agents_omitted)),
+      "events_omitted": max(0, int(events_omitted) + compacted_events),
+    },
+  }
+
+
 def build_documents(model: dict, attribution: Attribution, now: float,
                     chat_helpers: Optional[dict[str, list[dict]]] = None,
-                    chat_turns: Optional[dict[str, list[dict]]] = None
+                    chat_turns: Optional[dict[str, list[dict]]] = None,
+                    lifecycle_events: Optional[list[dict]] = None,
+                    lifecycle_runs: Optional[list[dict]] = None,
+                    lifecycle_events_omitted: Optional[dict[str, int]] = None,
                     ) -> tuple[dict, dict[str, dict], dict[str, dict], dict[str, dict]]:
-  """Rebuild schema-v3 journal, chat, and prompt documents."""
+  """Rebuild schema-v4 journal, chat, prompt and lifecycle documents."""
   sessions = model["sessions"]
   evidence: dict[str, dict[str, list[dict]]] = {}
   synthetic_turns: dict[str, list[dict]] = {}
   providers: dict[str, str] = {}
   unlinked: dict[str, dict] = {}
+  events_by_chat: dict[str, list[dict]] = {}
+  runs_by_chat: dict[str, list[dict]] = {}
+  visible_chat_ids = set(attribution.chats)
+  for event in lifecycle_events or []:
+    if (isinstance(event, dict) and event.get("chat_id")
+        and str(event["chat_id"]) in visible_chat_ids):
+      events_by_chat.setdefault(str(event["chat_id"]), []).append(event)
+  for run in lifecycle_runs or []:
+    if (isinstance(run, dict) and run.get("chat_id")
+        and str(run["chat_id"]) in visible_chat_ids):
+      runs_by_chat.setdefault(str(run["chat_id"]), []).append(run)
 
   # Group runs by resolved chat. A session with no runs but that resolves to a
   # chat contributes nothing (it is the chat's own top-level turn); a session
@@ -2391,6 +3328,8 @@ def build_documents(model: dict, attribution: Attribution, now: float,
         synthetic_turns.setdefault(chat_id, []).append(_trace_turn(run, run_evidence))
 
   for chat_id, helpers in (chat_helpers or {}).items():
+    if chat_id not in visible_chat_ids:
+      continue
     provider = attribution.chats.get(chat_id, {}).get("provider") or providers.get(chat_id) or "claude"
     providers[chat_id] = provider
     for helper in helpers:
@@ -2402,13 +3341,15 @@ def build_documents(model: dict, attribution: Attribution, now: float,
   chats: dict[str, dict] = {}
   helpers_out: dict[str, dict] = {}
   used_helper_ids: dict[str, str] = {}
-  all_chat_ids = set(evidence) | set(chat_turns or {})
+  all_chat_ids = ((set(evidence) | set(chat_turns or {}) | set(events_by_chat))
+                  & visible_chat_ids)
   for chat_id in all_chat_ids:
-    if chat_id not in evidence or not evidence[chat_id]:
+    if ((chat_id not in evidence or not evidence[chat_id])
+        and not events_by_chat.get(chat_id)):
       continue  # roster contains chats with background helpers, not tool-only chats
     provider = providers.get(chat_id) or attribution.chats.get(chat_id, {}).get("provider") or "claude"
     merged: dict[str, dict] = {}
-    for original_id, records in evidence[chat_id].items():
+    for original_id, records in evidence.get(chat_id, {}).items():
       helper = _merge_evidence(records, provider)
       public_id = original_id
       if public_id in used_helper_ids and used_helper_ids[public_id] != chat_id:
@@ -2418,10 +3359,31 @@ def build_documents(model: dict, attribution: Attribution, now: float,
       helper["agent_id"] = public_id
       merged[original_id] = helper
 
+    chat_platform_events = events_by_chat.get(chat_id, [])
+    _platform_overlay(merged, chat_platform_events, provider)
+    merged, agents_omitted = _retain_recent_helpers(merged)
+    retained_agent_ids = {str(helper["agent_id"]) for helper in merged.values()}
+    retained_platform_events = [
+      event for event in chat_platform_events
+      if str(event.get("agent_id")) in retained_agent_ids
+    ]
+    events_omitted = (len(chat_platform_events) - len(retained_platform_events)
+                      + max(0, int((lifecycle_events_omitted or {}).get(chat_id, 0))))
+
     owner_turns = list((chat_turns or {}).get(chat_id, []))
     referenced = {aid for turn in owner_turns for aid in turn.get("_agent_ids", [])}
     raw_turns = owner_turns + [turn for turn in synthetic_turns.get(chat_id, [])
                                if any(aid not in referenced for aid in turn.get("_agent_ids", []))]
+    if not raw_turns and merged:
+      first_event = min(events_by_chat.get(chat_id, []),
+                        key=lambda row: row.get("id", 0), default={})
+      raw_turns = [{
+        "ts": first_event.get("occurred_at") or first_event.get("observed_at"),
+        "_agent_ids": list(merged.keys()),
+        "_facts": {"area_evidence": [], "verb": "Investigated",
+                   "changed": False, "verification": "none"},
+        "_original": "", "_first_request": "",
+      }]
     stored_title = str(attribution.chats.get(chat_id, {}).get("title") or "Untitled chat")
     turns = [_build_v3_turn(raw, merged, stored_title) for raw in raw_turns]
     turns.sort(key=lambda turn: turn.get("ts") or "")
@@ -2443,16 +3405,23 @@ def build_documents(model: dict, attribution: Attribution, now: float,
       "title": clip_line(title, 120), "outcome": summary_turn["outcome"],
       "prompt_full": clip_markdown(first_request, FULL_PROMPT_CAP) or "",
       "ts": ts, "turns": turns,
+      "timeline": _build_timeline(
+        chat_id, provider, merged, retained_platform_events,
+        runs_by_chat.get(chat_id, []), turns,
+        agents_omitted=agents_omitted, events_omitted=events_omitted),
     }
     chats[chat_id] = doc
     for helper in merged.values():
       public_id = helper["agent_id"]
+      if not helper.get("brief_full"):
+        continue
       helpers_out[public_id] = {
         "schema": SCHEMA_VERSION, "agent_id": public_id, "chat_id": chat_id,
         "brief_full": helper["brief_full"],
       }
 
-  index = _build_index(chats, helpers_out, now)
+  chats, helpers_out, chats_omitted = _retain_recent_chats(chats, helpers_out)
+  index = _build_index(chats, helpers_out, now, chats_omitted=chats_omitted)
   return index, chats, helpers_out, unlinked
 
 
@@ -2464,18 +3433,61 @@ def _cap_report(text: str) -> str:
   return out.encode("utf-8")[:FINAL_REPORT_CAP].decode("utf-8", "ignore") + "…"
 
 
-def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: float) -> dict:
+def _retain_recent_chats(chats: dict[str, dict], helpers: dict[str, dict]
+                         ) -> tuple[dict[str, dict], dict[str, dict], int]:
+  """Keep the newest bounded journal core beneath its reserved byte budget."""
+  ordered = sorted(chats.items(), key=lambda item: (
+    _iso_to_epoch(item[1].get("ts")) or float("-inf"), item[0]), reverse=True)
+  kept: dict[str, dict] = {}
+  total = 0
+  for chat_id, doc in ordered[:MAX_JOURNAL_CHATS]:
+    size = len(json.dumps(doc, ensure_ascii=False).encode("utf-8"))
+    if kept and total + size > BASE_ARTIFACT_TARGET_BYTES:
+      continue
+    kept[chat_id] = doc
+    total += size
+  keep_ids = set(kept)
+  retained_helpers = {
+    helper_id: doc for helper_id, doc in helpers.items()
+    if doc.get("chat_id") in keep_ids
+  }
+  return kept, retained_helpers, len(chats) - len(kept)
+
+
+def _document_status(doc: dict) -> tuple[str, str]:
+  """Owner-facing status with the latest durable root run as a hard gate."""
+  status, result = _chat_status(doc.get("turns") or [])
+  runs = ((doc.get("timeline") or {}).get("main_runs") or [])
+  if not runs:
+    return status, result
+  latest = max(runs, key=lambda run: (
+    _iso_to_epoch(run.get("started_at")) or float("-inf"), str(run.get("id") or "")))
+  run_status = str(latest.get("status") or "").lower()
+  if run_status in ("running", "resume_pending"):
+    return "running", "in progress"
+  if run_status == "failed":
+    return "attention", "couldn't complete"
+  if run_status in ("stopped", "interrupted", "cancelled", "canceled"):
+    return "attention", "stopped"
+  if run_status in ("parked", "parked_notified"):
+    return "attention", "paused"
+  # A clean root completion does not erase a helper failure already captured
+  # in the trace-derived turn; it only prevents older root failures winning.
+  return status, result
+
+
+def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: float,
+                 chats_omitted: int = 0) -> dict:
   entries: list[dict] = []
   needs_attention: list[dict] = []
-  task_counts: dict[str, int] = {}
-  for helper in helpers_out.values():
-    task_counts[helper["chat_id"]] = task_counts.get(helper["chat_id"], 0) + 1
   for chat_id, doc in chats.items():
-    status, result = _chat_status(doc["turns"])
+    status, result = _document_status(doc)
     row = {
       "chat_id": chat_id, "provider": doc["provider"], "title": doc["title"],
       "outcome": doc["outcome"], "result": result,
-      "status": status, "tasks": task_counts.get(chat_id, 0), "ts": doc.get("ts"),
+      "status": status,
+      "tasks": len((doc.get("timeline") or {}).get("agents") or []),
+      "ts": doc.get("ts"),
     }
     entries.append(row)
     if status != "done":
@@ -2489,7 +3501,8 @@ def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: floa
     for row in entries if row["chat_id"] in attention_ids
   ]
   return {"schema": SCHEMA_VERSION, "updated_at": _epoch_to_iso(now),
-          "needs_attention": needs_attention, "entries": entries}
+          "needs_attention": needs_attention, "entries": entries,
+          "history": {"chats_omitted": max(0, int(chats_omitted))}}
 
 
 # --- storage sink -----------------------------------------------------------
@@ -2719,7 +3732,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   now = time.time()
   model = load_json(state_dir / "model.json", None) or _new_model()
   previous_schema = model.get("schema")
-  reset_owner_state = previous_schema not in (2, SCHEMA_VERSION)
+  reset_owner_state = previous_schema not in (2, 3, SCHEMA_VERSION)
   # Trace accumulators are forward-compatible. v2 owner turns are migrated in
   # place below; only pre-v2 rail/gist caches require a bounded owner-chat rescan.
   model["schema"] = SCHEMA_VERSION
@@ -2764,6 +3777,104 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
       "written_paths": [], "degraded": True, "degraded_reason": reason,
     }
 
+  lifecycle_path = state_dir / "agent-lifecycle-v4.json"
+  lifecycle_state = load_json(lifecycle_path, {})
+  if not isinstance(lifecycle_state, dict):
+    lifecycle_state = {}
+  if lifecycle_state.get("schema") != LIFECYCLE_CACHE_SCHEMA:
+    # Event support is part of the cursor contract. Replaying from zero on a
+    # parser-schema bump recovers event types older parsers intentionally
+    # skipped for privacy/forward compatibility.
+    lifecycle_state = {}
+  try:
+    lifecycle_after_id = max(0, int(lifecycle_state.get("after_id") or 0))
+  except (TypeError, ValueError):
+    lifecycle_after_id = 0
+  try:
+    lifecycle_runs_after_id = max(0, int(lifecycle_state.get("runs_after_id") or 0))
+  except (TypeError, ValueError):
+    lifecycle_runs_after_id = 0
+  had_roster_snapshot = isinstance(lifecycle_state.get("visible_chat_ids"), list)
+  previous_visible = {
+    str(chat_id) for chat_id in lifecycle_state.get("visible_chat_ids", [])
+    if isinstance(chat_id, str)
+  }
+  current_visible = set(chats_meta)
+  (lifecycle_ok, lifecycle_supported, lifecycle_events, lifecycle_runs,
+   lifecycle_cursor, lifecycle_runs_cursor) = (
+    fetch_agent_lifecycle(
+      base_url, service_token, lifecycle_after_id, lifecycle_runs_after_id))
+  lifecycle_stale = not lifecycle_ok
+  if lifecycle_ok and lifecycle_supported:
+    lifecycle_state = merge_lifecycle_state(
+      lifecycle_state, lifecycle_events, lifecycle_runs, lifecycle_cursor,
+      runs_cursor=lifecycle_runs_cursor, preferred_chat_ids=current_visible)
+    # The global cursor is immutable, while chat visibility is not. A recovered
+    # chat may have old event ids below that cursor, so newly visible roster
+    # members get one scoped snapshot replay. Initial install is already a full
+    # global replay and avoids N per-chat requests.
+    known_visible = previous_visible & current_visible
+    known_lifecycle = {
+      str(chat_id) for chat_id in lifecycle_state.get("known_lifecycle_chat_ids", [])
+      if isinstance(chat_id, str)
+    }
+    cached_lifecycle_chats = {
+      str(row.get("chat_id"))
+      for row in lifecycle_state.get("events", [])
+      if isinstance(row, dict) and row.get("chat_id")
+    }
+    chats_needing_runs = {
+      str(row.get("chat_id"))
+      for row in lifecycle_state.get("events", [])
+      if isinstance(row, dict) and row.get("chat_id") and row.get("chat_run_id")
+    }
+    cached_run_chats = {
+      str(row.get("chat_id"))
+      for row in lifecycle_state.get("runs", [])
+      if isinstance(row, dict) and row.get("chat_id")
+    }
+    replay_ids = set(current_visible - previous_visible) if had_roster_snapshot else set()
+    # A busy newer chat can evict an older chat from the bounded global cache
+    # without changing roster visibility. Remember which chats ever had facts
+    # and replay any such missing current chat from its scoped snapshot.
+    replay_ids.update((known_lifecycle & current_visible) - cached_lifecycle_chats)
+    replay_ids.update((chats_needing_runs & current_visible) - cached_run_chats)
+    for replay_chat_id in sorted(replay_ids):
+      (replay_ok, replay_supported, replay_events, replay_runs,
+       _, _) = fetch_agent_lifecycle(
+         base_url, service_token, 0, 0, chat_id=replay_chat_id)
+      if not (replay_ok and replay_supported):
+        lifecycle_stale = True
+        continue
+      lifecycle_state = merge_lifecycle_state(
+        lifecycle_state, replay_events, replay_runs,
+        lifecycle_state.get("after_id", lifecycle_cursor),
+        runs_cursor=lifecycle_state.get("runs_after_id", lifecycle_runs_cursor),
+        preferred_chat_ids=current_visible, pinned_chat_ids={replay_chat_id},
+        count_new_events=False)
+      known_visible.add(replay_chat_id)
+    if not had_roster_snapshot:
+      known_visible = current_visible
+    lifecycle_state["visible_chat_ids"] = sorted(known_visible)
+  # A missing endpoint or transient failure never clears a prior successful
+  # prefix. With no prior prefix, trace evidence remains the honest fallback.
+  cached_lifecycle_events = (lifecycle_state.get("events", [])
+                             if isinstance(lifecycle_state.get("events"), list) else [])
+  cached_lifecycle_runs = (lifecycle_state.get("runs", [])
+                           if isinstance(lifecycle_state.get("runs"), list) else [])
+  cached_event_counts: dict[str, int] = {}
+  for event in cached_lifecycle_events:
+    if isinstance(event, dict) and event.get("chat_id"):
+      chat_id = str(event["chat_id"])
+      cached_event_counts[chat_id] = cached_event_counts.get(chat_id, 0) + 1
+  raw_seen_counts = lifecycle_state.get("events_seen_by_chat")
+  lifecycle_events_omitted = {
+    chat_id: max(0, int(count or 0) - cached_event_counts.get(chat_id, 0))
+    for chat_id, count in (raw_seen_counts.items()
+                           if isinstance(raw_seen_counts, dict) else [])
+    if chat_id in current_visible
+  }
+
   tooluse_map = load_json(state_dir / "tooluse-map.json", {})
   if any(tuid not in tooluse_map
          for s in model["sessions"].values() for tuid in s.get("tool_use_ids", [])):
@@ -2807,7 +3918,10 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   attribution = Attribution(links, tooluse_map, chats_meta)
   index, chats, helpers, unlinked = build_documents(
     model, attribution, now, chat_helpers=chat_helpers_state,
-    chat_turns=chat_turns_state)
+    chat_turns=chat_turns_state,
+    lifecycle_events=cached_lifecycle_events,
+    lifecycle_runs=cached_lifecycle_runs,
+    lifecycle_events_omitted=lifecycle_events_omitted)
 
   output_sink: StorageSink = sink or HttpSink(base_url, app_id, app_token)
   written = flush_documents(index, chats, helpers, output_sink, digests)
@@ -2820,6 +3934,8 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   save_json(helper_scanned_path, helper_scanned)
   save_json(state_dir / "chat-helpers.json", chat_helpers_state)
   save_json(state_dir / "chat-turns.json", chat_turns_state)
+  if lifecycle_state:
+    save_json(lifecycle_path, lifecycle_state)
 
   return {
     "chats": len(index["entries"]),
@@ -2829,7 +3945,8 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
     "bytes_parsed": budget.bytes_read,
     "budget_exhausted": budget.exhausted,
     "written_paths": written,
-    "degraded": False,
+    "degraded": False, "lifecycle_stale": lifecycle_stale,
+    "lifecycle_supported": lifecycle_supported,
   }
 
 
@@ -2890,8 +4007,11 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                 "message": {"role": "user", "content": "Investigate the flaky test"}}),
     json.dumps({"type": "assistant", "timestamp": "2026-07-17T10:00:02Z",
                 "message": {"role": "assistant",
-                            "content": [{"type": "tool_use", "name": "Read",
-                                         "input": {"file_path": "/data/x.py"}}],
+                            "content": [
+                              {"type": "tool_use", "name": "Read",
+                               "input": {"file_path": "/data/x.py"}},
+                              {"type": "tool_use", "name": "Task", "id": "toolu_NESTED",
+                               "input": {"description": "Check nested fixture"}}],
                             "usage": {"input_tokens": 100, "output_tokens": 20}}}),
     json.dumps({"type": "assistant", "timestamp": "2026-07-17T10:00:03Z",
                 "message": {"role": "assistant",
@@ -2899,6 +4019,17 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                                          f"Root cause found: token {fake_secret} in log."}],
                             "stop_reason": "end_turn",
                             "usage": {"input_tokens": 5, "output_tokens": 40}}}),
+  ]) + "\n")
+  _write(sub / "agent-taskNested.meta.json",
+         json.dumps({"agentType": "general-purpose", "description": "Check nested fixture",
+                     "toolUseId": "toolu_NESTED", "spawnDepth": 2}))
+  _write(sub / "agent-taskNested.jsonl", "\n".join([
+    json.dumps({"type": "user", "timestamp": "2026-07-17T10:00:02Z",
+                "message": {"role": "user", "content": "Check the nested fixture"}}),
+    json.dumps({"type": "assistant", "timestamp": "2026-07-17T10:00:02.500Z",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "Nested check complete."}],
+                            "stop_reason": "end_turn"}}),
   ]) + "\n")
   # a workflow run: record + phases + one journal-completed agent.
   wf_id = "wf_abc123"
@@ -2952,6 +4083,8 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                             "message": "Refactor complete, tests pass."}}),
     json.dumps({"timestamp": "2026-07-17T12:05:03Z", "type": "event_msg",
                 "payload": {"type": "task_complete",
+                            "completed_at": "2026-07-17T12:05:03Z",
+                            "duration_ms": 3000,
                             "last_agent_message": "Refactor complete, tests pass."}}),
   ]) + "\n")
   return cc, codex
@@ -3003,8 +4136,9 @@ def selftest() -> int:
     # --- schema-shape asserts (json-schema-ish) ---
     _assert(index["schema"] == SCHEMA_VERSION, "index schema")
     _assert(isinstance(index["updated_at"], str), "index.updated_at is ISO")
-    _assert(set(index) == {"schema", "updated_at", "needs_attention", "entries"},
+    _assert(set(index) == {"schema", "updated_at", "needs_attention", "entries", "history"},
             f"index keys: {set(index)}")
+    _assert(index["history"] == {"chats_omitted": 0}, "journal retention is explicit")
     _assert(len(index["entries"]) == 2,
             f"expected 2 chats, got {len(index['entries'])}")
     for row in index["entries"]:
@@ -3018,7 +4152,14 @@ def selftest() -> int:
     doc_a = chats["chatA"]
     _assert(doc_a["provider"] == "claude", "chatA provider")
     _assert(set(doc_a) == {"schema", "chat_id", "provider", "title", "outcome",
-                           "prompt_full", "ts", "turns"}, f"chat keys: {set(doc_a)}")
+                           "prompt_full", "ts", "turns", "timeline"},
+            f"chat keys: {set(doc_a)}")
+    _assert(set(doc_a["timeline"]) == {
+      "main_agent_id", "main_runs", "agents", "events", "retention"},
+            f"timeline keys: {set(doc_a['timeline'])}")
+    _assert(doc_a["timeline"]["retention"] == {
+      "agents_omitted": 0, "events_omitted": 0},
+      "timeline retention is explicit")
     _assert(doc_a["prompt_full"] == fixture_request, "root prompt is published")
     _assert(doc_a["turns"], "chat has derived turns")
     for turn in doc_a["turns"]:
@@ -3057,6 +4198,337 @@ def selftest() -> int:
     _assert("019f0000-child0" in child_agent_ids, "codex child linked to parent chat")
     _assert(model["agents"]["019f0000-child0::019f0000-child0"]["final_report_terminal"] is True,
             "Codex task_complete marks a terminal report")
+    codex_child = model["agents"]["019f0000-child0::019f0000-child0"]
+    _assert(codex_child["started_at"] == "2026-07-17T12:05:00+00:00"
+            and codex_child["ended_at"] == "2026-07-17T12:05:03Z"
+            and codex_child["started_time_quality"] == "exact"
+            and codex_child["ended_time_quality"] == "exact",
+            f"Codex completed_at-duration gives exact bounds: {codex_child}")
+    nested = model["agents"][f"{claude_sid}::taskNested"]
+    _assert(nested["parent_agent_id"] == "taskA" and nested["spawn_depth"] == 2,
+            f"Claude nested parent resolves by tool id: {nested}")
+    nested_public = next(agent for agent in doc_a["timeline"]["agents"]
+                         if agent["agent_id"] == "taskNested")
+    _assert(nested_public["parent_agent_id"] == "taskA"
+            and nested_public["start_time_quality"] == "observed",
+            f"nested timeline preserves exact edge and observed bound: {nested_public}")
+
+    # Platform lifecycle is authoritative over trace status/timing while the
+    # trace remains the source for the lazily-loaded, scrubbed prompt.
+    platform_rows = [
+      {"id": 12, "event_key": "a-terminal", "chat_id": "chatA",
+       "chat_run_id": "run-A", "provider": "claude",
+       "provider_session_id": claude_sid, "agent_id": "opaque-a",
+       "provider_agent_id": "taskA", "parent_agent_id": None,
+       "type": "agent_terminal", "state": "done", "agent_type": "general-purpose",
+       "summary": "Platform completion", "occurred_at": "2026-07-17T10:00:04Z",
+       "observed_at": "2026-07-17T10:00:04Z", "time_quality": "exact",
+       "source": "runner", "source_event_id": "native-terminal"},
+      # Intentionally listed after the terminal and timestamped later; causal
+      # ordering must still put start before terminal without altering raw time.
+      {"id": 11, "event_key": "a-start", "chat_id": "chatA",
+       "chat_run_id": "run-A", "provider": "claude",
+       "provider_session_id": claude_sid, "agent_id": "opaque-a",
+       "provider_agent_id": "taskA", "parent_agent_id": None,
+       "type": "agent_started", "state": "running", "agent_type": "general-purpose",
+       "summary": "Investigate the flaky test", "occurred_at": "2026-07-17T10:00:05Z",
+       "observed_at": "2026-07-17T10:00:05Z", "time_quality": "exact",
+       "source": "runner", "source_event_id": "native-start"},
+      {"id": 13, "event_key": "b-start", "chat_id": "chatA",
+       "chat_run_id": "run-A", "provider": "claude",
+       "provider_session_id": claude_sid, "agent_id": "opaque-b",
+       "provider_agent_id": "provider-b", "parent_agent_id": None,
+       "type": "agent_started", "state": "running", "agent_type": "research",
+       "summary": "Review overlapping work", "occurred_at": None,
+       "observed_at": "2026-07-17T10:00:02Z", "time_quality": "observed",
+       "source": "runner", "source_event_id": "native-b-start"},
+    ]
+    platform_events = [_normalized_lifecycle_event(row) for row in platform_rows]
+    _assert(all(platform_events), "platform fixture normalizes")
+    model_platform = json.loads(json.dumps(model))
+    model_platform["agents"][f"{claude_sid}::taskA"]["result"] = "failed"
+    _, platform_chats, platform_helpers, _ = build_documents(
+      model_platform, attribution, now,
+      chat_turns={"chatA": [{
+        "_agent_ids": ["taskA"], "_tools": [], "_original": "Investigation started.",
+        "_first_request": fixture_request, "ts": "2026-07-17T10:00:00Z",
+      }]}, lifecycle_events=platform_events,
+      lifecycle_runs=[{"id": "run-A", "chat_id": "chatA", "provider": "claude",
+                       "status": "completed", "started_at": "2026-07-17T10:00:00Z",
+                       "ended_at": "2026-07-17T10:00:06Z"}])
+    platform_doc = platform_chats["chatA"]
+    opaque_a = next(agent for agent in platform_doc["timeline"]["agents"]
+                    if agent["agent_id"] == "opaque-a")
+    opaque_b = next(agent for agent in platform_doc["timeline"]["agents"]
+                    if agent["agent_id"] == "opaque-b")
+    _assert(opaque_a["state"] == "done", "platform terminal wins over failed trace")
+    _assert(opaque_a["started_at"] is None and opaque_a["timing_conflict"] is True,
+            f"contradictory aggregate bounds are suppressed: {opaque_a}")
+    _assert(any(sub["agent_id"] == "opaque-a" for turn in platform_doc["turns"]
+                for sub in turn["subs"]),
+            "native turn retains its platform-renamed helper")
+    _assert(platform_helpers["opaque-a"]["brief_full"] == "Investigate the flaky test",
+            "platform overlay retains the trace prompt document")
+    _assert(opaque_b["parent_agent_id"] is None and opaque_b["ended_at"] is None
+            and opaque_b["start_time_quality"] == "observed"
+            and opaque_b["started_at"] == "2026-07-17T10:00:02Z",
+            f"observed-only open helper stays honest: {opaque_b}")
+    a_events = [event for event in platform_doc["timeline"]["events"]
+                if event["subject_agent_id"] == "opaque-a"]
+    _assert([event["type"] for event in a_events] == ["agent_started", "agent_terminal"],
+            f"terminal-before-start input is causally ordered: {a_events}")
+    checkpoints = [event for event in platform_doc["timeline"]["events"]
+                   if event["type"] == "main_checkpoint"]
+    _assert(checkpoints and all(event["subject_agent_id"] == "main"
+                                for event in checkpoints),
+            f"owner turns become canonical main checkpoints: {checkpoints}")
+    _assert(checkpoints[0]["order"]
+            < next(event["order"] for event in platform_doc["timeline"]["events"]
+                   if event["event_id"] == "platform-" + hashlib.sha256(
+                     b"b-start").hexdigest()[:24]),
+            "owner and helper events share one timestamp-ordered stream")
+    failed_index = _build_index({"chatA": {
+      **platform_doc,
+      "timeline": {**platform_doc["timeline"], "main_runs": [
+        *platform_doc["timeline"]["main_runs"],
+        {"id": "run-latest-failed", "status": "failed",
+         "started_at": "2026-07-17T10:10:00Z", "ended_at": "2026-07-17T10:10:01Z"},
+      ]},
+    }}, {}, now)
+    _assert(failed_index["entries"][0]["status"] == "attention"
+            and failed_index["needs_attention"],
+            "latest durable root failure drives the journal and attention strip")
+
+    # A lifecycle-only chat must render without any trace/chat-block evidence.
+    life_only_raw = {"id": 20, "event_key": "only-start", "chat_id": "chatOnly",
+                     "chat_run_id": "run-only", "provider": "codex",
+                     "agent_id": "only-agent", "provider_agent_id": "native-only",
+                     "parent_agent_id": None, "type": "agent_started", "state": "running",
+                     "agent_type": "codex", "summary": "Inspect lifecycle-only data",
+                     "occurred_at": "2026-07-17T11:00:00Z",
+                     "observed_at": "2026-07-17T11:00:00Z", "time_quality": "exact",
+                     "source": "runner", "source_event_id": "only-native"}
+    life_only = _normalized_lifecycle_event(life_only_raw)
+    _assert(_normalized_lifecycle_event(
+      dict(life_only_raw, agent_id="../escape")) is None,
+      "lifecycle identities cannot escape helper storage paths")
+    life_attribution = Attribution({}, {}, {
+      "chatOnly": {"title": "Lifecycle only", "provider": "codex"}})
+    _, life_chats, life_helpers, _ = build_documents(
+      _new_model(), life_attribution, now, lifecycle_events=[life_only])
+    _assert(life_chats["chatOnly"]["timeline"]["agents"][0]["agent_id"] == "only-agent",
+            "lifecycle-only chat renders without trace evidence")
+    _assert(not life_helpers
+            and life_chats["chatOnly"]["turns"][0]["subs"][0]["prompt_available"] is False,
+            "lifecycle-only helpers do not advertise or emit empty prompt documents")
+    _, deleted_chats, _, _ = build_documents(
+      _new_model(), Attribution({}, {}, {}), now, lifecycle_events=[life_only])
+    _assert(not deleted_chats,
+            "cached lifecycle rows cannot republish a chat absent from the owner roster")
+
+    # A platform start is additive evidence, not proof that a trace-terminal
+    # Codex helper resumed. Current Codex instrumentation has no positive done
+    # marker, so retaining this stronger trace terminal is essential.
+    codex_start_raw = dict(
+      life_only_raw, id=22, event_key="codex-start-only", chat_id="chatC",
+      provider_agent_id="019f0000-child0", agent_id="opaque-codex",
+      summary="Refactor the parser")
+    _, start_only_chats, _, _ = build_documents(
+      model, attribution, now,
+      lifecycle_events=[_normalized_lifecycle_event(codex_start_raw)])
+    start_only_agent = next(
+      agent for agent in start_only_chats["chatC"]["timeline"]["agents"]
+      if agent["agent_id"] == "opaque-codex")
+    _assert(start_only_agent["state"] == "done",
+            f"start-only evidence cannot revive trace completion: {start_only_agent}")
+
+    # Re-running ancestry reconciliation must remove a once-unique edge if a
+    # later incremental parse reveals a second possible owner.
+    ambiguous_model = json.loads(json.dumps(model))
+    second_owner = _agent(ambiguous_model, claude_sid, "tasks", "taskOther", "tasks")
+    second_owner["spawned_tool_use_ids"] = ["toolu_NESTED"]
+    _resolve_claude_parents(ambiguous_model, claude_sid, "tasks")
+    _assert(ambiguous_model["agents"][f"{claude_sid}::taskNested"]["parent_agent_id"] is None,
+            "ambiguous Claude replay clears a formerly unique parent")
+
+    observed_model = _new_model()
+    _fold_codex_subagent_activity({
+      "type": "sub_agent_activity", "agent_thread_id": "observed-child",
+      "kind": "started"}, "observed-root", observed_model,
+      "2026-07-17T12:00:00Z")
+    observed_agent = observed_model["agents"]["observed-root::observed-child"]
+    _assert(observed_agent["started_time_quality"] == "observed",
+            "record timestamp fallback is observed, not provider-exact")
+
+    prior_agent_cap = globals()["MAX_TIMELINE_AGENTS"]
+    try:
+      globals()["MAX_TIMELINE_AGENTS"] = 2
+      retained, omitted = _retain_recent_helpers({
+        "old": {"agent_id": "old", "started_at": "2026-01-01T00:00:00Z"},
+        "mid": {"agent_id": "mid", "started_at": "2026-02-01T00:00:00Z"},
+        "new": {"agent_id": "new", "started_at": "2026-03-01T00:00:00Z"},
+      })
+      _assert(set(retained) == {"mid", "new"} and omitted == 1,
+              "helper retention is bounded, recent and explicit")
+    finally:
+      globals()["MAX_TIMELINE_AGENTS"] = prior_agent_cap
+
+    prior_cache_cap = globals()["MAX_LIFECYCLE_CACHE_EVENTS"]
+    try:
+      globals()["MAX_LIFECYCLE_CACHE_EVENTS"] = 2
+      saturated = {
+        "schema": LIFECYCLE_CACHE_SCHEMA, "after_id": 100,
+        "events": [
+          {"id": 99, "event_id": "e99", "chat_id": "new-a"},
+          {"id": 100, "event_id": "e100", "chat_id": "new-b"},
+        ],
+        "runs": [], "visible_chat_ids": ["recovered"],
+        "known_lifecycle_chat_ids": ["recovered"],
+        "events_seen_by_chat": {"recovered": 1},
+      }
+      recovered = merge_lifecycle_state(
+        saturated, [{"id": 1, "event_id": "e1", "chat_id": "recovered"}],
+        [], 100, preferred_chat_ids={"recovered"}, count_new_events=False)
+      _assert("e1" in {row["event_id"] for row in recovered["events"]},
+              "scoped replay survives a saturated newer global cache")
+      _assert(recovered["events_seen_by_chat"]["recovered"] == 1,
+              "scoped replay does not double-count cache omissions")
+      all_current = merge_lifecycle_state(
+        saturated, [{"id": 1, "event_id": "e1", "chat_id": "recovered"}],
+        [], 100, preferred_chat_ids={"recovered", "new-a", "new-b"},
+        pinned_chat_ids={"recovered"}, count_new_events=False)
+      _assert("e1" in {row["event_id"] for row in all_current["events"]},
+              "scoped replay is pinned even when every cached chat is current")
+    finally:
+      globals()["MAX_LIFECYCLE_CACHE_EVENTS"] = prior_cache_cap
+
+    tombstoned = merge_lifecycle_state(
+      {"runs": [{"id": "rolled-back", "chat_id": "chatA",
+                  "status": "running", "started_at": None}],
+       "events": [], "after_id": 0, "runs_after_id": 1},
+      [], [{"update_id": 2, "id": "rolled-back", "chat_id": "chatA",
+            "status": "deleted", "started_at": None, "ended_at": None}],
+      0, runs_cursor=2)
+    _assert(not tombstoned["runs"] and tombstoned["runs_after_id"] == 2,
+            "run tombstone removes a rolled-back root run without rewinding")
+
+    # Duplicates and overlaps remain one event each in chronological/causal order.
+    overlap = [
+      _timeline_event("a-s", "agent_started", "a", "main", "running",
+                      "2026-07-17T00:00:01Z", None, "exact"),
+      _timeline_event("b-s", "agent_started", "b", "main", "running",
+                      "2026-07-17T00:00:02Z", None, "exact"),
+      _timeline_event("b-e", "agent_terminal", "b", "b", "done",
+                      "2026-07-17T00:00:03Z", None, "exact"),
+      _timeline_event("a-e", "agent_terminal", "a", "a", "done",
+                      "2026-07-17T00:00:04Z", None, "exact"),
+      _timeline_event("a-s", "agent_started", "a", "main", "running",
+                      "2026-07-17T00:00:01Z", None, "exact"),
+    ]
+    overlap_ordered = _ordered_timeline_events(overlap, {"a": "main", "b": "main"})
+    _assert([row["event_id"] for row in overlap_ordered] == ["a-s", "b-s", "b-e", "a-e"],
+            f"overlap and duplicate order is stable: {overlap_ordered}")
+    dense = [
+      _timeline_event(f"dense-{index}", "agent_started", f"dense-{index}",
+                      "main", "running", None, None, "unknown",
+                      source_order=index)
+      for index in range(2_000)
+    ]
+    dense_ordered = _ordered_timeline_events(
+      dense, {f"dense-{index}": "main" for index in range(2_000)})
+    _assert(len(dense_ordered) == 2_000
+            and dense_ordered[-1]["event_id"] == "dense-1999",
+            "dense causal ordering remains complete and deterministic")
+    simultaneous_checkpoints = _ordered_timeline_events([
+      _timeline_event("cp-1", "main_checkpoint", "main", "main", "done",
+                      "2026-07-17T00:00:02Z", None, "exact", "First result"),
+      _timeline_event("cp-2", "main_checkpoint", "main", "main", "done",
+                      "2026-07-17T00:00:02Z", None, "exact", "Second result"),
+    ], {})
+    _assert(len(simultaneous_checkpoints) == 2,
+            "distinct owner checkpoints at the same timestamp are retained")
+
+    # Lifecycle pagination commits only complete prefixes; malformed pages are
+    # a failed fetch and therefore cannot replace the caller's last-good cache.
+    original_api_get = globals()["_api_get_json"]
+    fetch_calls: list[str] = []
+    terminal_only_raw = dict(life_only_raw, id=21, event_key="only-terminal",
+                             type="agent_terminal", state="done",
+                             occurred_at="2026-07-17T11:00:02Z",
+                             observed_at="2026-07-17T11:00:02Z")
+    def _fake_lifecycle_pages(base_url: str, path: str, token: str):
+      fetch_calls.append(path)
+      if "?after_id=0&" in path:
+        return 200, {"events": [life_only_raw], "runs": [],
+                     "next_after_id": 20, "next_runs_after_id": 0,
+                     "has_more": True, "runs_has_more": False}
+      return 200, {"events": [terminal_only_raw],
+                   "runs": [{"update_id": 1, "id": "run-only", "chat_id": "chatOnly",
+                              "provider": "codex", "status": "done",
+                              "started_at": "2026-07-17T11:00:00Z",
+                              "ended_at": "2026-07-17T11:00:02Z"}],
+                   "next_after_id": 21, "next_runs_after_id": 1,
+                   "has_more": False, "runs_has_more": False}
+    try:
+      globals()["_api_get_json"] = _fake_lifecycle_pages
+      (fetch_ok, fetch_supported, fetched_events, fetched_runs,
+       fetched_cursor, fetched_runs_cursor) = (
+        fetch_agent_lifecycle("http://fixture", "token"))
+      _assert(fetch_ok and fetch_supported and fetched_cursor == 21
+              and fetched_runs_cursor == 1
+              and len(fetched_events) == 2 and len(fetched_runs) == 1
+              and len(fetch_calls) == 2,
+              f"lifecycle pages form one complete prefix: {fetch_calls}")
+      cached_once = merge_lifecycle_state(
+        {}, fetched_events, fetched_runs, fetched_cursor,
+        runs_cursor=fetched_runs_cursor)
+      cached_twice = merge_lifecycle_state(
+        cached_once, fetched_events, fetched_runs, fetched_cursor,
+        runs_cursor=fetched_runs_cursor)
+      _assert(len(cached_twice["events"]) == 2 and len(cached_twice["runs"]) == 1,
+              "lifecycle cache merge is idempotent")
+      globals()["_api_get_json"] = lambda *_args: (200, {
+        "events": "truncated", "runs": [], "next_after_id": 22,
+        "next_runs_after_id": 1, "has_more": False, "runs_has_more": False})
+      bad_ok, _, bad_events, bad_runs, bad_cursor, bad_runs_cursor = fetch_agent_lifecycle(
+        "http://fixture", "token", after_id=21)
+      _assert(not bad_ok and not bad_events and not bad_runs and bad_cursor == 21
+              and bad_runs_cursor == 0,
+              "malformed lifecycle page preserves the caller's prior cursor")
+    finally:
+      globals()["_api_get_json"] = original_api_get
+
+    # Existing schema-3 accumulators gain v4 defaults lazily, and Codex parent
+    # thread ids resolve only when the complete ancestry evidence is present.
+    legacy = {
+      "schema": 3,
+      "sessions": {
+        "root": {"provider": "codex", "last_activity_at": None,
+                 "parent_thread_id": None, "tool_use_ids": []},
+        "nested": {"provider": "codex", "last_activity_at": None,
+                   "parent_thread_id": "root", "tool_use_ids": []},
+        "hollow": {"provider": "codex", "last_activity_at": None,
+                   "parent_thread_id": "root", "tool_use_ids": []},
+      },
+      "agents": {}, "runs": {},
+    }
+    migrated = _agent(legacy, "nested", "collab", "nested", "collab")
+    _session(legacy, "root", "codex")
+    migrated["parent_agent_id"] = "root"
+    grandchild = _agent(legacy, "nested", "collab", "grandchild", "collab")
+    grandchild["parent_agent_id"] = "nested"
+    unknown_parent = _agent(legacy, "nested", "collab", "orphan", "collab")
+    unknown_parent["parent_agent_id"] = "missing-thread"
+    missing_parent_agent = _agent(legacy, "nested", "collab", "partial", "collab")
+    missing_parent_agent["parent_agent_id"] = "hollow"
+    _enforce_parent_invariant(legacy)
+    _assert("spawned_tool_use_ids" in migrated and "spawn_depth" in legacy["sessions"]["root"],
+            "schema-3 state receives all v4 defaults")
+    _assert(migrated["parent_agent_id"] == "main"
+            and grandchild["parent_agent_id"] == "nested"
+            and unknown_parent["parent_agent_id"] is None
+            and missing_parent_agent["parent_agent_id"] is None,
+            "known nested ancestry is retained while unknown ancestry stays unknown")
 
     # === finding-specific asserts =========================================
 

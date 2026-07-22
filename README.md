@@ -2,15 +2,15 @@
 
 Workflows is an outcome journal for the background work in your Möbius chats. The journal leads with completed outcomes and groups activity by day. A “worth a look” strip gathers unfinished, failed, or unconfirmed work.
 
-Open an entry to see its prompt-and-branches timeline. The main task stays on one trunk; helpers branch from the turn that spawned them. Each branch shows its task and lifecycle at a glance, while the full prompt stays one click away.
+Open an entry to see a chronological execution timeline. Time flows downward on a fixed main-agent lane; concurrent helpers occupy temporary side lanes, and nested helpers connect to the helper that launched them. Each lane shows the task and lifecycle at a glance, while the full prompt stays one click away.
 
 ## What it records
 
 The journal records three layers of background activity:
 
 - The outcome and status of each chat with background activity.
-- A turn-by-turn main-agent timeline with any recorded verification concern.
-- Each helper’s task summary, full prompt, and lifecycle on the branch where it ran.
+- A time-based main-agent timeline with concurrent and nested helper lanes.
+- Each helper’s task summary, full prompt, duration, and honestly recorded lifecycle.
 
 ## Evidence and status
 
@@ -20,7 +20,7 @@ The parser scrubs secret-shaped values from free text and caps it before publica
 
 ## How Workflows builds the journal
 
-The scheduled and on-demand refresh job incrementally scans local Claude and Codex trace artifacts. It joins sessions to chats through explicit link evidence, then publishes compact schema v3 documents to the app’s storage. The interface reads only those documents. Job diagnostics retain unlinked traces instead of guessing which chat owns them.
+The scheduled and on-demand refresh job consumes the platform’s normalized lifecycle feed and incrementally scans local Claude and Codex traces for prompt and fallback evidence. It joins sessions to chats only through explicit link evidence, then publishes bounded schema-v4 documents to the app’s storage. The interface reads only those documents. Job diagnostics retain unlinked traces instead of guessing which chat owns them.
 
 The scan budget splits large histories across multiple runs. Separate timeouts bound metadata reads and storage writes. A full refresh can therefore take longer than the scan budget.
 

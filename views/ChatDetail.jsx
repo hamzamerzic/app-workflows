@@ -1,10 +1,9 @@
 // ChatDetail — the layered execution view for one chat.
 //
-// The root is the owner's prompt. Below it, main-agent turns continue down a
-// single trunk and helpers branch off at the point where they were spawned.
-// The skim layer contains only task summaries and lifecycle. Full prompts are
-// native inline disclosures; tool calls and raw execution logs stay out of the
-// primary experience.
+// The root is the owner's prompt. Below it, time flows down a fixed main-agent
+// lane while helpers occupy concurrent lanes for their recorded lifetimes.
+// Selecting a launch opens its prompt in a stable inspector; tool calls and raw
+// execution logs stay out of the primary experience.
 
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo } from 'react'
 import { providerLabel, subStateMeta } from '../domain.js'
@@ -27,6 +26,38 @@ function rootState(turns) {
   if (!last || last.status === 'done') return 'done'
   if (last.result === "couldn't complete") return 'failed'
   return 'stopped'
+}
+
+function timelineRootState(timeline, turns) {
+  const agents = timeline && Array.isArray(timeline.agents) ? timeline.agents : []
+  const runs = timeline && Array.isArray(timeline.main_runs) ? timeline.main_runs : []
+  // The header describes where the chat is now. Historical failures and
+  // interrupted runs remain in the timeline but must not override a newer run.
+  const orderedRuns = [...runs].sort((a, b) => {
+    const at = Date.parse(a && a.started_at || '')
+    const bt = Date.parse(b && b.started_at || '')
+    if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt
+    return String(a && a.id || '').localeCompare(String(b && b.id || ''))
+  })
+  const latestRun = orderedRuns[orderedRuns.length - 1]
+  if (latestRun) {
+    if (['running', 'resume_pending'].includes(latestRun.status)) return 'running'
+    if (latestRun.status === 'failed') return 'failed'
+    if (['stopped', 'interrupted', 'cancelled', 'canceled', 'parked', 'parked_notified'].includes(latestRun.status)) return 'stopped'
+    if (latestRun.status === 'completed') {
+      const currentAgents = agents.filter((agent) => agent.chat_run_id === latestRun.id)
+      if (currentAgents.some((agent) => agent.state === 'running')) return 'running'
+      if (currentAgents.some((agent) => agent.state === 'failed')) return 'failed'
+      if (currentAgents.some((agent) => agent.state === 'stopped')) return 'stopped'
+      if (currentAgents.length) return 'done'
+      return rootState(turns)
+    }
+  }
+  if (agents.some((agent) => agent.state === 'running')) return 'running'
+  if (agents.some((agent) => agent.state === 'failed')) return 'failed'
+  if (agents.some((agent) => agent.state === 'stopped')) return 'stopped'
+  if (agents.length && agents.every((agent) => agent.state === 'done')) return 'done'
+  return rootState(turns)
 }
 
 export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOpenChat }) {
@@ -59,11 +90,15 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
   const prompt = (detail && typeof detail.prompt_full === 'string') ? detail.prompt_full.trim() : ''
   const provider = (detail && detail.provider) || (chatMeta && chatMeta.provider)
   const turns = (detail && Array.isArray(detail.turns)) ? detail.turns : []
+  const timeline = (detail && detail.timeline && typeof detail.timeline === 'object') ? detail.timeline : null
+  const timelineAgents = timeline && Array.isArray(timeline.agents) ? timeline.agents : []
+  const timelineEvents = timeline && Array.isArray(timeline.events) ? timeline.events : []
   const loaded = detail !== undefined
-  const isEmpty = loaded && turns.length === 0
+  const isEmpty = loaded && turns.length === 0 && timelineAgents.length === 0 && timelineEvents.length === 0
   const when = fmtShortDate((detail && detail.ts) || (chatMeta && chatMeta.ts))
-  const taskCount = turns.reduce((sum, turn) => sum + (Array.isArray(turn.subs) ? turn.subs.length : 0), 0)
-  const state = subStateMeta(rootState(turns))
+  const taskCount = timelineAgents.length || turns.reduce(
+    (sum, turn) => sum + (Array.isArray(turn.subs) ? turn.subs.length : 0), 0)
+  const state = subStateMeta(timelineRootState(timeline, turns))
 
   useLayoutEffect(() => {
     if (!loaded || isEmpty) return
@@ -138,7 +173,7 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
                 )}
               </div>
             </section>
-            <Timeline turns={turns} store={store} storage={storage} />
+            <Timeline timeline={timeline} turns={turns} store={store} storage={storage} />
           </div>
         )}
       </main>
