@@ -1,14 +1,14 @@
-// ChatDetail — the VISUAL drill-in for one chat. A slim "‹ Activity" appbar,
-// then a chat hero (title, provider chip, step count + date, and "Open chat"
-// jumping to the real conversation), then the vertical turn-spine (Timeline).
+// ChatDetail — the layered execution view for one chat.
 //
-// Owns the loading/empty states, the subscription to the chat document the job
-// writes, and scroll/disclosure RESTORATION: because drilling into a subagent
-// unmounts this view, the scroll position and which Technical-detail disclosures
-// were open are kept in a per-chat store (owned by App) and re-applied on return.
+// The root is the owner's prompt. Below it, main-agent turns continue down a
+// single trunk and helpers branch off at the point where they were spawned.
+// The skim layer contains only task summaries and lifecycle. Full prompts are
+// native inline disclosures; tool calls and raw execution logs stay out of the
+// primary experience.
 
-import React, { useState, useEffect, useRef, useLayoutEffect } from 'react'
-import { providerLabel } from '../domain.js'
+import React, { useState, useEffect, useRef, useLayoutEffect, useMemo } from 'react'
+import { providerLabel, subStateMeta } from '../domain.js'
+import { Markdown } from './Markdown.jsx'
 import { Timeline } from './Timeline.jsx'
 
 function fmtShortDate(ts) {
@@ -21,44 +21,50 @@ function fmtShortDate(ts) {
              : { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
-export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOpenHelper, onOpenChat }) {
+function rootState(turns) {
+  if (turns.some((turn) => turn.status === 'running')) return 'running'
+  const last = turns[turns.length - 1]
+  if (!last || last.status === 'done') return 'done'
+  if (last.result === "couldn't complete") return 'failed'
+  return 'stopped'
+}
+
+export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOpenChat }) {
   const [detail, setDetail] = useState(undefined)
+  const [rootPromptOpen, setRootPromptOpen] = useState(false)
   const scrollRef = useRef(null)
-  // The last position we programmatically applied. Used to tell "the content
-  // grew, re-apply the saved scroll" apart from "the user scrolled away, stop".
   const lastAppliedRef = useRef(-1)
 
-  // The per-chat store: scroll position + which turns have Technical detail
-  // open. Lives in a Map owned by App so it outlives this component's unmount
-  // on drill-in to a subagent.
-  const store = (() => {
-    let s = viewStates && viewStates.get(chatId)
-    if (!s) { s = { scrollTop: 0, tech: new Set() }; if (viewStates) viewStates.set(chatId, s) }
-    // Guard against a store shaped by an older build.
-    if (!s.tech) s.tech = new Set()
-    return s
-  })()
+  // Create the view state without mutating the shared Map during render. The
+  // effect publishes a newly-created state after commit; event handlers then
+  // update the stable object directly while this view is mounted.
+  const store = useMemo(() => {
+    const existing = viewStates && viewStates.get(chatId)
+    if (existing) return { ...existing, prompts: existing.prompts || new Set() }
+    return { scrollTop: 0, prompts: new Set() }
+  }, [viewStates, chatId])
+  useEffect(() => {
+    if (viewStates) viewStates.set(chatId, store)
+  }, [viewStates, chatId, store])
 
   useEffect(() => {
     lastAppliedRef.current = -1
+    setRootPromptOpen(store.prompts.has('root'))
     setDetail(undefined)
     const unsub = storage.subscribe(`chats/${chatId}.json`, setDetail)
     return () => { try { unsub && unsub() } catch (_) { /* noop */ } }
-  }, [storage, chatId])
+  }, [storage, chatId, store])
 
   const title = (detail && detail.title) || (chatMeta && chatMeta.title) || 'Chat'
+  const prompt = (detail && typeof detail.prompt_full === 'string') ? detail.prompt_full.trim() : ''
   const provider = (detail && detail.provider) || (chatMeta && chatMeta.provider)
   const turns = (detail && Array.isArray(detail.turns)) ? detail.turns : []
   const loaded = detail !== undefined
   const isEmpty = loaded && turns.length === 0
   const when = fmtShortDate((detail && detail.ts) || (chatMeta && chatMeta.ts))
+  const taskCount = turns.reduce((sum, turn) => sum + (Array.isArray(turn.subs) ? turn.subs.length : 0), 0)
+  const state = subStateMeta(rootState(turns))
 
-  // Restore the saved scroll after the spine mounts with its disclosures
-  // re-opened (they restore synchronously via useState). Re-runs whenever the
-  // chat DOCUMENT changes — a late/fuller doc can grow the scrollable range, and
-  // a one-shot restore would have clamped to the earlier, shorter height and
-  // landed too high. It re-applies only while the user hasn't moved from our
-  // last applied position; once they scroll away, it stops fighting them.
   useLayoutEffect(() => {
     if (!loaded || isEmpty) return
     const el = scrollRef.current
@@ -72,13 +78,17 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
     return () => cancelAnimationFrame(raf)
   }, [loaded, isEmpty, detail, store])
 
-  // Save the user's position — but IGNORE our own programmatic restore (whose
-  // resulting scroll event lands exactly on lastApplied), so the clamped-short
-  // value never overwrites the real saved scrollTop and defeats the re-clamp.
   const onScroll = () => {
     const el = scrollRef.current
     if (!el || el.scrollTop === lastAppliedRef.current) return
     store.scrollTop = el.scrollTop
+  }
+
+  const onRootToggle = (event) => {
+    const next = event.currentTarget.open
+    setRootPromptOpen(next)
+    if (next) store.prompts.add('root')
+    else store.prompts.delete('root')
   }
 
   return (
@@ -86,40 +96,49 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
       <header className="wf-header">
         <button type="button" className="wf-back-text" onClick={onBack}>‹ Activity</button>
         <span className="wf-spacer" />
+        <button type="button" className="wf-openchat" onClick={() => onOpenChat(chatId)}>
+          Open chat ↗
+        </button>
       </header>
 
-      <main className="wf-scroll" ref={scrollRef} onScroll={onScroll}>
+      <main className="wf-scroll" ref={scrollRef} onScroll={onScroll} tabIndex={0} aria-label="Workflow timeline">
         {!loaded ? (
           <div className="wf-loading" role="status" aria-live="polite">
             <div className="wf-spinner" aria-hidden="true" />
-            <span className="wf-sr-only">Loading chat activity</span>
+            <span className="wf-sr-only">Loading workflow</span>
           </div>
         ) : isEmpty ? (
           <div className="wf-empty">
             <div className="wf-empty-mark" aria-hidden="true">✶</div>
             <div className="wf-empty-title">No recorded activity</div>
-            <p className="wf-empty-text">
-              This chat has no background work recorded yet. It will appear here the
-              next time its helpers run.
-            </p>
+            <p className="wf-empty-text">This chat has no background work recorded yet.</p>
           </div>
         ) : (
-          <div className="wf-content">
-            <div className="wf-chat-hero">
-              <h1 className="wf-chat-title">{title}</h1>
-              <div className="wf-chat-meta">
-                {provider && <span className="wf-chan">{providerLabel(provider)}</span>}
-                {provider && <span className="wf-sep" aria-hidden="true" />}
-                <span>
-                  {turns.length} step{turns.length === 1 ? '' : 's'}{when ? ` · ${when}` : ''}
-                </span>
-                <span className="wf-hero-spacer" />
-                <button type="button" className="wf-openchat" onClick={() => onOpenChat(chatId)}>
-                  Open chat ↗
-                </button>
+          <div className="wf-flow">
+            <section className="wf-root-task" aria-labelledby="wf-root-task-title">
+              <span className="wf-root-node" aria-hidden="true" />
+              <div className="wf-root-body">
+                <div className="wf-flow-label">Main task</div>
+                <h1 className="wf-chat-title" id="wf-root-task-title">{title}</h1>
+                <div className="wf-chat-meta">
+                  {provider && <span>{providerLabel(provider)}</span>}
+                  {provider && when && <span className="wf-sep" aria-hidden="true" />}
+                  {when && <span>{when}</span>}
+                  {(provider || when) && taskCount > 0 && <span className="wf-sep" aria-hidden="true" />}
+                  {taskCount > 0 && <span>{taskCount} helper{taskCount === 1 ? '' : 's'}</span>}
+                  <span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span>
+                </div>
+                {prompt && (
+                  <details className="wf-prompt" open={rootPromptOpen} onToggle={onRootToggle}>
+                    <summary className="wf-prompt-sum">
+                      <span className="wf-cx" aria-hidden="true">›</span> Full prompt
+                    </summary>
+                    {rootPromptOpen && <div className="wf-prompt-body"><Markdown text={prompt} /></div>}
+                  </details>
+                )}
               </div>
-            </div>
-            <Timeline turns={turns} chatId={chatId} onOpenHelper={onOpenHelper} store={store} />
+            </section>
+            <Timeline turns={turns} store={store} storage={storage} />
           </div>
         )}
       </main>

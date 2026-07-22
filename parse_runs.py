@@ -6,15 +6,15 @@ Claude CLI and Codex SDK on-disk session traces under `/data`, reconstructs
 which owner chat spawned which helper (workflow phases, Task subagents, Codex
 collab agents), and writes three families of storage documents the mini-app
 renders — an `index.json` roster, one `chats/<chat_id>.json` per chat, and one
-`helpers/<agent_id>.json` detail page per helper. The document shapes
+`helpers/<agent_id>.json` prompt document per helper. The document shapes
 are the frozen schema the UI and this job both code to (see `SCHEMA_NOTES`).
 
 Design commitments that shaped every function here:
 
 - **Status is derived from artifacts, never model-generated.** Records sharing
   an `agent_id` are reconciled once; terminal downstream evidence supersedes an
-  async launch acknowledgement. `report_full` keeps the helper's OWN words,
-  scrubbed and capped, while the plain-language result is deterministic.
+  async launch acknowledgement. Reports and tools inform that verdict but are
+  not published into the skim-first UI contract.
 - **Attribution is looked up, never guessed.** A session is joined to a chat
   only through the explicit signals in `Attribution` (session-links API, then a
   Task `tool_use_id` match, then a workflow/collab parent link). We never join
@@ -52,7 +52,7 @@ from typing import Callable, Iterable, Iterator, Optional, Protocol
 
 # --- schema + budget + caps -------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # A single invocation scans one slice of a possibly-huge backfill. These caps
 # bound trace parsing, not metadata reads or storage publication. Persist scan
@@ -75,10 +75,14 @@ MAX_RECORD_BYTES = 4 * 1024 * 1024
 # Freshness window for the "working" verdict: a transcript touched within this
 # is treated as a live helper, older is treated as terminal (stopped/finished).
 FRESH_SECS = 15 * 60
+# Tolerate ordinary clock skew, but never let a corrupt far-future timestamp
+# keep a helper "running" for months or years.
+FUTURE_SKEW_SECS = 5 * 60
 
 # Structural caps applied at emit time so one runaway helper cannot produce an
 # unbounded document.
 FINAL_REPORT_CAP = 8 * 1024
+FULL_PROMPT_CAP = 256 * 1024
 OUTCOME_CAP = 280
 DETAIL_LINE_CAP = 160
 
@@ -89,14 +93,13 @@ ACCUM_STEP_CAP = 240
 
 # Total self-imposed ceiling for app-side artifacts. Well under the platform's
 # per-app 1 GiB storage quota; when exceeded we evict the oldest helper detail
-# pages (never the roster or chat summaries) — see enforce_app_cap.
+# prompt documents (never the roster or chat summaries) — see enforce_app_cap.
 APP_ARTIFACT_CAP_BYTES = 100 * 1024 * 1024
 
 SCHEMA_NOTES = """\
-index.json  {schema, updated_at, needs_attention:[...], entries:[...]}
-chats/<id> {schema, chat_id, provider, title, outcome, ts, turns:[...]}
-helpers/<id> {schema, agent_id, chat_id, kind, name, ask, brief_full,
-              did:[{verb,label,count}], result, report_full, next, commands}
+index.json  {schema, updated_at, needs_attention:[{chat_id,outcome}], entries:[...]}
+chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...]}
+helpers/<id> {schema, agent_id, chat_id, brief_full}
 """
 
 
@@ -465,8 +468,10 @@ def _agent(model: dict, sid: str, run_id: str, agent_id: str, kind: str) -> dict
   a = model["agents"].setdefault(akey, {
     "sid": sid, "run_id": run_id, "run_kind": kind, "agent_id": agent_id,
     "agent_type": "", "description": "", "tool_use_id": None, "goal": "",
+    "spawn_depth": 1,
     "steps": [], "final_report": "", "tokens": 0, "started_at": None,
     "last_ts": None, "has_activity": False, "result": None,
+    "final_report_terminal": None, "interrupted": False,
     "board_status": None, "source_expired": False, "truncated": False,
   })
   a["run_id"] = run_id
@@ -563,6 +568,10 @@ def _load_agent_meta(meta_path: Path, agent: dict, model: dict, sid: str) -> Non
   if not isinstance(meta, dict):
     return
   agent["agent_type"] = str(meta.get("agentType") or agent["agent_type"] or "")
+  try:
+    agent["spawn_depth"] = max(1, int(meta.get("spawnDepth") or agent.get("spawn_depth") or 1))
+  except (TypeError, ValueError):
+    agent["spawn_depth"] = max(1, int(agent.get("spawn_depth") or 1))
   if meta.get("description"):
     agent["description"] = str(meta["description"])
   tuid = meta.get("toolUseId")
@@ -594,8 +603,15 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
     if not isinstance(msg, dict):
       continue
     role = msg.get("role")
-    if role == "user" and not agent["goal"]:
+    if role == "user":
       goal = msg.get("content")
+      user_text = goal if isinstance(goal, str) else "\n".join(
+        str(b.get("text") or "") for b in (goal or []) if isinstance(b, dict))
+      if "[request interrupted by user]" in user_text.lower():
+        agent["interrupted"] = True
+        agent["has_activity"] = True
+      if agent["goal"]:
+        continue
       if isinstance(goal, str):
         agent["goal"] = goal
       elif isinstance(goal, list):
@@ -606,9 +622,17 @@ def _fold_agent_transcript(tr: Path, agent: dict, model: dict, sid: str,
       agent["tokens"] += _usage_tokens(msg)
       if text:
         agent["final_report"] = text
+        agent["final_report_terminal"] = str(msg.get("stop_reason") or "").lower() in (
+          "end_turn", "stop_sequence", "stop")
+        agent["interrupted"] = False
         agent["has_activity"] = True
       for name, detail in tools:
         agent["steps"].append({"kind": "tool", "title": name, "detail": detail})
+        # Claude emits commentary text and its following tool-use as separate
+        # records for the same model turn. Once a tool follows the text, that
+        # text was progress—not a terminal handback.
+        agent["final_report_terminal"] = False
+        agent["interrupted"] = False
         agent["has_activity"] = True
       _trim_accum_steps(agent)
 
@@ -627,7 +651,8 @@ def _reset_agent_digest(agent: dict) -> None:
   and lookup fields (agent_type, description, tool_use_id, goal, result,
   board_status) intact — only the streamed-in accumulation is reset."""
   agent.update({"steps": [], "final_report": "", "tokens": 0,
-                "started_at": None, "last_ts": None, "has_activity": False})
+                "started_at": None, "last_ts": None, "has_activity": False,
+                "final_report_terminal": None, "interrupted": False})
 
 
 def _parse_journal(journal_path: Path, sid: str, run_id: str, kind: str,
@@ -907,12 +932,26 @@ def _fold_codex_helper_activity(rtype: Optional[str], payload: dict, sid: str,
   if rtype == "response_item" and payload.get("type") == "function_call":
     agent["steps"].append({"kind": "tool", "title": str(payload.get("name") or "tool"),
                            "detail": _short_input(_json_or_none(payload.get("arguments")))})
+    agent["final_report_terminal"] = False
+    agent["interrupted"] = False
     agent["has_activity"] = True
     _trim_accum_steps(agent)
   elif rtype == "event_msg" and payload.get("type") == "agent_message":
     if payload.get("message"):
       agent["final_report"] = str(payload["message"])
+      agent["final_report_terminal"] = payload.get("phase") == "final_answer"
+      agent["interrupted"] = False
       agent["has_activity"] = True
+  elif rtype == "event_msg" and payload.get("type") == "task_complete":
+    if payload.get("last_agent_message"):
+      agent["final_report"] = str(payload["last_agent_message"])
+    agent["final_report_terminal"] = True
+    agent["interrupted"] = False
+    agent["has_activity"] = True
+  elif rtype == "event_msg" and payload.get("type") == "turn_aborted":
+    agent["final_report_terminal"] = False
+    agent["interrupted"] = True
+    agent["has_activity"] = True
   elif rtype == "event_msg" and payload.get("type") == "user_message" and not agent["goal"]:
     agent["goal"] = str(payload.get("text") or payload.get("message") or "")
 
@@ -1188,6 +1227,23 @@ def _is_async_ack(text) -> bool:
   return bool(_ASYNC_ACK.fullmatch(text) or _ASYNC_ACK_ENVELOPE.match(text))
 
 
+_PROGRESS_REPORT = re.compile(
+  r"(?:\b(?:now\s+)?let me\s+(?:read|scan|fetch|search|inspect|check|look|start|"
+  r"continue|run|verify|examine|trace|review|test|open|find|analy[sz]e|compile)\b|"
+  r"\bi(?:'|’)ll\s+(?:read|scan|fetch|search|inspect|check|look|start|continue|"
+  r"run|verify|examine|trace|review|test|open|find|analy[sz]e|compile)\b|"
+  r"\b(?:compiling|continuing|investigating|checking|reading|searching|verifying|"
+  r"reviewing|testing)\s+(?:the|a|an|this|that|my|our)\b)", re.I)
+
+
+def _looks_progress_report(text) -> bool:
+  """Conservative migration fallback for cached digests created before the
+  parser retained explicit terminal markers. It catches procedural handoffs,
+  but deliberately does not match phrases such as "let me know" that commonly
+  appear in genuine final answers."""
+  return isinstance(text, str) and bool(_PROGRESS_REPORT.search(text))
+
+
 def helper_from_agent_block(block: dict, ordinal: int = 0,
                             scope: str = "") -> Optional[dict]:
   """One bounded helper-evidence record derived from an `Agent` tool block.
@@ -1203,6 +1259,15 @@ def helper_from_agent_block(block: dict, ordinal: int = 0,
   raw_input = block.get("input")
   raw_input = raw_input if isinstance(raw_input, str) else ""
   body, agent_id, _usage = _split_agent_output(block.get("output"))
+  # Some chat renderers persist placeholder Task blocks with either an empty
+  # input or only "Working in the background", plus an empty output. Neither
+  # shape records an assignment, helper identity, or lifecycle evidence; the
+  # tool-use call id is not an agent id. Publishing it creates invented helper
+  # rows named "No brief was recorded".
+  if (not raw_input.strip()
+      or raw_input.strip().lower() == "working in the background"
+      ) and not str(body or "").strip():
+    return None
   is_async = _is_async_ack(body)
 
   if body is None:
@@ -1244,7 +1309,7 @@ def helper_from_agent_block(block: dict, ordinal: int = 0,
     "status": state,
     # A helper's returned payload is arbitrary text and can quote a secret.
     "_full_outcome": _cap_report(scrub(body)) if body and not is_async else None,
-    "_brief_full": clip_prompt(prompt) or "",
+    "_brief_full": clip_markdown(prompt, FULL_PROMPT_CAP) or "",
     # A launch hint only; joined terminal evidence supersedes it later.
     "is_async": is_async,
   }
@@ -1294,14 +1359,11 @@ def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int,
   """A deterministic id for a helper whose payload never named one, so the same
   block keeps the same identity across runs instead of churning storage.
 
-  The block's position in the chat is part of the seed because two spawns can
-  be genuinely indistinguishable — production has a pair whose input AND output
-  are both empty, and content alone hashes them together. They are still two
-  helpers, so they must not collapse into one record; position is the only
-  thing left that separates them, and it is stable as long as the transcript is
-  append-only.
+  The block's position in the chat is part of the seed because two valid spawns
+  can still carry identical prompts. They must not collapse into one record;
+  position is the remaining stable discriminator in an append-only transcript.
   """
-  # `scope` is the chat id when available. v2 helper documents are globally
+  # `scope` is the chat id when available. Helper prompt documents are globally
   # addressed as helpers/<agent_id>.json, so identical blank/trimmed blocks in
   # two chats must not collide.
   seed = f"{scope}|{ordinal}|{goal or ''}|{raw_input[:200]}"
@@ -1309,35 +1371,22 @@ def _stable_agent_id(goal: Optional[str], raw_input: str, ordinal: int,
 
 
 # Ceiling so a chat document cannot grow without bound. The newest tool-using
-# turns are retained; helper detail remains available in its own document.
+# turns are retained; each helper's full prompt remains in its own document.
 MAX_CHAT_TURNS = 40
 
 
-# A spawn prompt / brief can be long; cap it generously enough to be a real
-# preview (multi-paragraph) but bounded so a chat doc full of subagents can't
-# bloat. Scrubbed like every other free-text field; "…" marks a cut.
-PROMPT_CAP = 700
-
-
-def clip_prompt(text: Optional[str]) -> Optional[str]:
-  if not text:
-    return None
-  out = scrub(text).strip()
-  if not out:
-    return None
-  return out[:PROMPT_CAP - 1] + "…" if len(out) > PROMPT_CAP else out
-
-
 def clip_markdown(text: Optional[str], cap: int) -> Optional[str]:
-  """Scrub + cap a free-text field but KEEP newlines, so the renderer can see
-  markdown structure (bullets, paragraphs). `clip_line` flattens newlines to
-  spaces and would collapse a list into one run-on line."""
+  """Scrub + byte-cap free text while keeping its markdown line structure."""
   if not text:
     return None
   out = scrub(str(text)).strip()
   if not out:
     return None
-  return out[:cap - 1] + "…" if len(out) > cap else out
+  encoded = out.encode("utf-8")
+  if len(encoded) <= cap:
+    return out
+  # Reserve three bytes for U+2026 and discard a partial trailing code point.
+  return encoded[:max(0, cap - 3)].decode("utf-8", "ignore") + "…"
 
 
 def _owner_request(text: str) -> str:
@@ -1353,16 +1402,16 @@ def _owner_request(text: str) -> str:
     r"</(?:agent_context|environment_context|system-reminder)>\s*", re.I)
   while envelope.match(out):
     out = envelope.sub("", out, count=1).strip()
-  return _cap_report(out)
+  return clip_markdown(out, FULL_PROMPT_CAP) or ""
 
 
 def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]:
   """Collect helper evidence and every tool-using assistant turn in one pass.
 
-  v2 deliberately includes a tool turn even when it did not spawn a helper: the
+  Schema v3 deliberately includes a tool turn even when it did not spawn a helper: the
   owner's requested Beat Machine validator example is such a turn, and omitting
   it would make the outcome journal skip the exact handback that needs review.
-  Private `_tools`/`_agent_ids` fields are bounded, scrubbed parse evidence; the
+  Private `_facts`/`_agent_ids` fields are bounded, scrubbed parse evidence; the
   public document is derived from them later after downstream helpers are joined.
   """
   helpers: list[dict] = []
@@ -1410,16 +1459,19 @@ def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]
             "input": clip_markdown(str(block.get("input") or ""), 1600) or "",
             "output": clip_markdown(str(block.get("output") or ""), 2400) or "",
           })
+    original = note_texts[-1] if note_texts else ""
     turns.append({
       "ts": msg.get("ts") if isinstance(msg.get("ts"), (int, float, str)) else last_user_ts,
-      "nblocks": len(blocks),
       "_agent_ids": agent_ids,
-      "_tools": tools,
-      "_original": note_texts[-1] if note_texts else "",
-      "_first_request": first_request,
+      "_facts": _compact_turn_facts(tools, original),
+      "_original": original,
+      "_first_request": "",
     })
   # Messages arrive oldest-first; retain the newest bounded window.
-  return helpers, turns[-MAX_CHAT_TURNS:]
+  turns = turns[-MAX_CHAT_TURNS:]
+  if turns and first_request:
+    turns[0]["_first_request"] = first_request
+  return helpers, turns
 
 
 def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
@@ -1513,14 +1565,17 @@ def derive_status(agent: dict, now: float) -> str:
   """Maps a helper digest to the frozen status vocabulary from ARTIFACTS ONLY.
 
   Order matters: explicit terminal failure/result wins over every launch or
-  freshness hint. A final report from an expired source is still terminal
-  evidence; expiration only means the internal trail is no longer available.
-  A fresh transcript remains working before a non-journal final note is accepted.
+  freshness hint. An interruption wins over prose, and only a report carrying
+  an explicit terminal marker is accepted as completion on newly parsed data.
+  A narrow procedural-text fallback exists solely for cached v2 accumulators
+  that predate those markers. A fresh transcript remains working.
   """
   if agent.get("board_status") == "failed" or _result_is_failure(agent.get("result")):
     return "failed"
   if _result_is_success(agent.get("result")):
     return "finished"
+  if _result_is_stopped(agent.get("result")) or agent.get("interrupted"):
+    return "stopped"
   report = agent.get("final_report")
   result = agent.get("result")
   ack = (report if _is_async_ack(report)
@@ -1530,8 +1585,15 @@ def derive_status(agent: dict, now: float) -> str:
     return "working" if _is_fresh(agent.get("last_ts"), now) else "stopped"
   if _is_fresh(agent.get("last_ts"), now):
     return "working"
-  if agent.get("final_report"):
+  if agent.get("final_report_terminal") is True:
     return "finished"
+  if agent.get("final_report_terminal") is False:
+    return "stopped" if agent.get("has_activity") else "unavailable"
+  # Cached v2 accumulators predate `final_report_terminal`. Preserve genuine
+  # historical handbacks, but demote clearly procedural text instead of
+  # repeating the old "any last assistant text means success" mistake.
+  if agent.get("final_report"):
+    return "stopped" if _looks_progress_report(agent["final_report"]) else "finished"
   if agent.get("source_expired"):
     return "unavailable"
   if agent.get("has_activity"):
@@ -1540,6 +1602,8 @@ def derive_status(agent: dict, now: float) -> str:
 
 
 def _result_is_failure(result) -> bool:
+  if isinstance(result, str):
+    return result.strip().lower() in ("failed", "failure", "error")
   if not isinstance(result, dict):
     return False
   status = str(result.get("collab_status", "")).lower()
@@ -1549,6 +1613,15 @@ def _result_is_failure(result) -> bool:
   return verdict in ("failed", "error")
 
 
+def _result_is_stopped(result) -> bool:
+  stopped = ("stopped", "cancelled", "canceled", "interrupted", "aborted")
+  if isinstance(result, str):
+    return result.strip().lower() in stopped
+  if not isinstance(result, dict):
+    return False
+  return str(result.get("collab_status") or result.get("status") or "").lower() in stopped
+
+
 def _result_is_success(result) -> bool:
   """A journal result (any non-failure dict) is the authoritative finished
   signal. A collab state that is still inProgress is NOT success."""
@@ -1556,17 +1629,25 @@ def _result_is_success(result) -> bool:
     return False
   if _is_async_ack(result):
     return False
+  if isinstance(result, str):
+    status = result.strip().lower()
+    if status in (_WORKING_WORDS | _STOPPED_WORDS | {"failure", "error"}):
+      return False
+    return bool(status)
   if isinstance(result, dict):
     status = str(result.get("collab_status", "")).lower()
-    if status in ("inprogress", "in_progress", "working", ""):
-      return status not in ("inprogress", "in_progress", "working")
+    if status in (_WORKING_WORDS | _STOPPED_WORDS):
+      return False
     return True
   return True
 
 
 def _is_fresh(ts_iso: Optional[str], now: float) -> bool:
   epoch = _iso_to_epoch(ts_iso)
-  return epoch is not None and (now - epoch) < FRESH_SECS
+  if epoch is None:
+    return False
+  age = now - epoch
+  return -FUTURE_SKEW_SECS <= age < FRESH_SECS
 
 
 # --- document assembly ------------------------------------------------------
@@ -1630,12 +1711,121 @@ def _resolved_state(states: Iterable[str]) -> str:
   return "stopped"
 
 
-def _plain_ask(text: Optional[str]) -> str:
-  line = clip_line(str(text or ""), 240)
+_TASK_VERBS = re.compile(
+  r"^(?:please\s+)?(?:audit|analy[sz]e|build|check|compare|design|diagnose|find|fix|"
+  r"implement|inspect|investigate|map|probe|research|review|test|trace|verify)\b", re.I)
+_PROMPT_PREAMBLE = re.compile(
+  r"^(?:you are\b|never\b|allowed\b|do not\b|don(?:'|’)t\b|important\b|"
+  r"context\b|platform shape\b|your final output\b|read-only\b)", re.I)
+_CONTEXT_LINE = re.compile(
+  r"^(?:there is\b|the (?:owner|partner|platform|app|system)\b|in some chats\b|"
+  r"symptoms?\b|background\b|known context\b|constraints?\b|rules?\b)", re.I)
+_EXPLICIT_TASK = re.compile(
+  r"^(?:priority\s+track|task|assignment|goal|scope|focus|subsystem|claim|finding)\s*"
+  r"(?:—|–|-|:)\s*(.+)$", re.I)
+
+
+def _json_object_after(raw: str, marker: str) -> Optional[dict]:
+  """Decode the first JSON object following a semantic marker.
+
+  Spawn prompts commonly wrap the unique assignment in `Place: {...}` or
+  `reported this finding: {...}` after a long reusable policy envelope. Parsing
+  that object is both more specific and safer than treating a lone `{` as the
+  task summary. Invalid or example JSON simply falls through to line scoring.
+  """
+  match = re.search(marker, raw, re.I)
+  if not match:
+    return None
+  start = raw.find("{", match.end())
+  if start < 0 or start - match.end() > 160:
+    return None
+  try:
+    value, _ = json.JSONDecoder().raw_decode(raw[start:])
+  except (TypeError, ValueError, json.JSONDecodeError):
+    return None
+  return value if isinstance(value, dict) else None
+
+
+def _structured_task(raw: str) -> str:
+  """Prefer the unique subject embedded in known structured prompt shapes."""
+  place = _json_object_after(raw, r"\bplace\s*:")
+  if place:
+    name = str(place.get("name") or "").strip()
+    if name:
+      return f"Fact-check {name}"
+
+  finding = _json_object_after(
+    raw, r"(?:reported\s+(?:this\s+)?finding|claimed\s+(?:issue|finding)|finding)\s*:")
+  if finding:
+    title = str(finding.get("title") or finding.get("name") or "").strip()
+    if title:
+      return f"Verify {title}"
+  return ""
+
+
+def _clean_task_line(line: str) -> str:
   line = re.sub(
     r"^(?:please\s+|your task is to\s+|i need you to\s+|i need to\s+)",
     "", line, flags=re.I).strip()
-  return line or "No brief was recorded"
+  line = re.split(r"(?<=[.!?])\s+", line, maxsplit=1)[0].strip()
+  line = line[:1].upper() + line[1:] if line else line
+  return clip_line(line, 140)
+
+
+def _task_summary_ranked(text: Optional[str]) -> tuple[str, int]:
+  """Return `(summary, specificity)` for one prompt or short description."""
+  raw = scrub(str(text or "")).strip()
+  if not raw:
+    return "", 0
+
+  structured = _structured_task(raw)
+  if structured:
+    return _clean_task_line(structured), 4
+
+  lines = []
+  for raw_line in raw.splitlines():
+    line = re.sub(r"^[#>*\-\d.)\s]+", "", raw_line).strip()
+    if line and re.search(r"[A-Za-z0-9]", line):
+      lines.append(line)
+
+  for line in lines:
+    explicit = _EXPLICIT_TASK.match(line)
+    if explicit and not re.match(r"^(?:context|constraints?|rules?)\b", line, re.I):
+      return _clean_task_line(explicit.group(1)), 3
+    named = re.match(r"^[A-Z][A-Z\s_-]{3,}\s*(?:—|:|-)\s*(.+)$", line)
+    if named and not re.match(r"^(?:context|constraints?|rules?)\b", line, re.I):
+      return _clean_task_line(named.group(1)), 3
+
+  imperative = next((line for line in lines if _TASK_VERBS.match(line)), "")
+  if imperative:
+    return _clean_task_line(imperative), 2
+
+  fallback = next((line for line in lines
+                   if not _PROMPT_PREAMBLE.match(line)
+                   and not _CONTEXT_LINE.match(line)), "")
+  if fallback:
+    return _clean_task_line(fallback), 1
+  return (_clean_task_line(lines[0]), 1) if lines else ("", 0)
+
+
+def _task_summary(text: Optional[str]) -> str:
+  """Extract one skimmable assignment line from a possibly policy-heavy prompt.
+
+  Helper prompts often begin with a long persona/safety envelope. The timeline
+  needs the task, not that envelope, so prefer a named track or an imperative
+  line and fall back to the first substantive sentence."""
+  return _task_summary_ranked(text)[0]
+
+
+def _plain_ask(text: Optional[str], prompt: Optional[str] = None) -> str:
+  short, short_rank = _task_summary_ranked(text)
+  full, full_rank = _task_summary_ranked(prompt)
+  # A structured or explicitly-labelled subject in the full prompt should beat
+  # a reusable generic description. On ties, preserve the intentionally short
+  # description written by the spawning agent.
+  if full_rank > short_rank:
+    return full
+  return short or full or "No brief was recorded"
 
 
 def _kind_and_name(agent_type: Optional[str], provider: str = "") -> tuple[str, str]:
@@ -1703,11 +1893,12 @@ def _trace_evidence(agent: dict, now: float, provider: str) -> dict:
     structured = result
   raw_report = agent.get("final_report") or structured
   report = "" if _is_async_ack(raw_report) else _cap_report(raw_report)
-  brief = clip_prompt(agent.get("goal")) or ""
+  brief = clip_markdown(agent.get("goal"), FULL_PROMPT_CAP) or ""
   return {
     "agent_id": str(agent["agent_id"]), "agent_type": agent.get("agent_type") or "",
-    "ask": _plain_ask(agent.get("description") or agent.get("goal")),
+    "ask": _plain_ask(agent.get("description"), agent.get("goal")),
     "brief_full": brief, "state": status, "report_full": report,
+    "depth": max(1, int(agent.get("spawn_depth") or 1)),
     "tools": tools, "next": "", "provider": provider, "origin": "trace",
     "ts": agent.get("started_at") or agent.get("last_ts"),
   }
@@ -1730,17 +1921,23 @@ def _next_from_handback(handback: dict) -> str:
 def _block_evidence(helper: dict, provider: str) -> dict:
   report = helper.get("_full_outcome") or ""
   is_async = bool(helper.get("is_async")) or _is_async_ack(report)
+  state = "running" if is_async else _canonical_state(helper.get("status"))
+  # Older chat caches can call a tool block "finished" even when its payload is
+  # plainly the helper's next intended action. Keep that cached bookkeeping
+  # from overriding a stopped trace during evidence reconciliation.
+  if state == "done" and _looks_progress_report(report):
+    state = "stopped"
   return {
     "agent_id": str(helper["agent_id"]),
     "agent_type": helper.get("agent_type") or "",
-    "ask": _plain_ask(helper.get("description") or helper.get("_brief_full")),
+    "ask": _plain_ask(helper.get("description"), helper.get("_brief_full")),
     "brief_full": helper.get("_brief_full") or "",
     # Re-detect the launch envelope here as well as at ingest so state cached by
     # an older parser is corrected without waiting for the chat to be rescanned.
-    "state": "running" if is_async else _canonical_state(helper.get("status")),
+    "state": state,
     "report_full": "" if is_async else report,
     "tools": [], "next": _next_from_handback(helper.get("_handback") or {}),
-    "provider": provider, "origin": "block", "ts": None,
+    "provider": provider, "origin": "block", "ts": None, "depth": None,
   }
 
 
@@ -1796,6 +1993,8 @@ def _merge_evidence(records: list[dict], provider: str) -> dict:
   types = [r.get("agent_type") or "" for r in records if r.get("agent_type")]
   tools = [tool for r in records for tool in r.get("tools", [])]
   next_lines = [r.get("next") or "" for r in records if r.get("next")]
+  depths = [int(r["depth"]) for r in records
+            if isinstance(r.get("depth"), int) and r["depth"] > 0]
   kind, name = _kind_and_name(types[0] if types else "", provider)
   did = _did_from_tools(tools)
   return {
@@ -1804,6 +2003,7 @@ def _merge_evidence(records: list[dict], provider: str) -> dict:
     "state": state, "acts": _acts_from_did(did),
     "result": _plain_result(report, state),
     "brief_full": max(briefs, key=len) if briefs else "",
+    "depth": max(depths) if depths else 1,
     "tappable": True, "did": did, "report_full": report,
     "next": next_lines[-1] if next_lines else "",
     "commands": _commands_from_tools(tools), "_tools": tools,
@@ -1892,6 +2092,97 @@ def _verification_signal(tools: list[dict], original: str) -> str:
   return "none"
 
 
+def _compact_area_evidence(parts: Iterable[str]) -> list[str]:
+  """Retain only path/ID markers that `_owner_noun` understands.
+
+  Raw tool inputs dominated the persistent state even though document assembly
+  only used a few app/shell/theme identifiers from them. These compact markers
+  preserve the same area classification without retaining command payloads.
+  """
+  text = "\n".join(str(part or "") for part in parts)
+  markers: list[str] = []
+  for slug in re.findall(r"/data/apps/([A-Za-z0-9_-]+)", text):
+    marker = f"/data/apps/{slug}"
+    if marker not in markers:
+      markers.append(marker)
+  for app_id in re.findall(r"(?:/api/apps/|/data/compiled/app-)(\d+)", text):
+    marker = f"/api/apps/{app_id}"
+    if marker not in markers:
+      markers.append(marker)
+  low = text.lower()
+  if "/data/shell/" in low:
+    markers.append("/data/shell/")
+  if "theme.css" in low or "/data/shared/" in low:
+    markers.append("theme.css")
+  return markers[:32]
+
+
+def _compact_turn_facts(tools: list[dict], original: str) -> dict:
+  return {
+    "area_evidence": _compact_area_evidence(
+      tool.get("input", "") for tool in tools if isinstance(tool, dict)),
+    "verb": _turn_verb(tools),
+    "changed": _has_change(tools),
+    "verification": _verification_signal(tools, original),
+  }
+
+
+def _compact_chat_turn(raw: dict, keep_request: bool = False) -> dict:
+  """Migrate one cached v2 owner turn to the compact v3 state shape."""
+  original = _cap_report(str(raw.get("_original") or ""))
+  tools = raw.get("_tools") if isinstance(raw.get("_tools"), list) else []
+  facts = raw.get("_facts") if isinstance(raw.get("_facts"), dict) else None
+  if facts is None:
+    facts = _compact_turn_facts(tools, original)
+  return {
+    "ts": raw.get("ts"),
+    "_agent_ids": [str(aid) for aid in (raw.get("_agent_ids") or []) if aid],
+    "_facts": facts,
+    "_original": original,
+    "_first_request": (clip_markdown(str(raw.get("_first_request") or ""), FULL_PROMPT_CAP) or ""
+                       if keep_request else ""),
+  }
+
+
+def _compact_chat_turns_state(state) -> dict[str, list[dict]]:
+  """Compact every cached chat without discarding attribution or chronology."""
+  if not isinstance(state, dict):
+    return {}
+  compacted: dict[str, list[dict]] = {}
+  for chat_id, rows in state.items():
+    if not isinstance(rows, list):
+      continue
+    first_request = next((str(row.get("_first_request") or "") for row in rows
+                          if isinstance(row, dict) and row.get("_first_request")), "")
+    out = [_compact_chat_turn(row) for row in rows if isinstance(row, dict)]
+    if out and first_request:
+      out[0]["_first_request"] = clip_markdown(first_request, FULL_PROMPT_CAP) or ""
+    compacted[str(chat_id)] = out[-MAX_CHAT_TURNS:]
+  return compacted
+
+
+def _clean_chat_helpers_state(state) -> dict[str, list[dict]]:
+  """Drop cached renderer placeholders that never represented a helper."""
+  if not isinstance(state, dict):
+    return {}
+  cleaned: dict[str, list[dict]] = {}
+  for chat_id, rows in state.items():
+    if not isinstance(rows, list):
+      continue
+    keep = []
+    for row in rows:
+      if not isinstance(row, dict):
+        continue
+      generated_id = str(row.get("agent_id") or "").startswith(("call_", "blk"))
+      placeholder = (generated_id and not row.get("description")
+                     and not row.get("_brief_full") and not row.get("_full_outcome"))
+      if not placeholder:
+        keep.append(row)
+    if keep:
+      cleaned[str(chat_id)] = keep
+  return cleaned
+
+
 def _hedges_result(original: str) -> bool:
   """Whether the agent's own closing words express positive doubt.
 
@@ -1922,25 +2213,45 @@ def _coerce_iso(value) -> Optional[str]:
   return None
 
 
-def _build_v2_turn(raw: dict, helpers: dict[str, dict],
+def _build_v3_turn(raw: dict, helpers: dict[str, dict],
                    request_hint: str = "") -> dict:
   subs = [helpers[aid] for aid in raw.get("_agent_ids", []) if aid in helpers]
   # Preserve one card per helper in a turn even when an async ack and later result
   # block both named the same agent_id.
   subs = list({sub["agent_id"]: sub for sub in subs}.values())
-  tools = list(raw.get("_tools", [])) + [tool for sub in subs for tool in sub.get("_tools", [])]
+  raw_tools = list(raw.get("_tools", []))
+  sub_tools = [tool for sub in subs for tool in sub.get("_tools", [])]
   original = _cap_report(str(raw.get("_original") or ""))
-  area = _owner_noun(
-    [t.get("input", "") for t in tools] +
-    [sub.get("brief_full", "") for sub in subs])
+  facts = raw.get("_facts") if isinstance(raw.get("_facts"), dict) else None
+  if facts is not None:
+    area = _owner_noun(
+      list(facts.get("area_evidence") or []) +
+      [t.get("input", "") for t in sub_tools] +
+      [sub.get("brief_full", "") for sub in subs])
+    sub_changed = _has_change(sub_tools)
+    changed = bool(facts.get("changed")) or sub_changed
+    sub_verb = _turn_verb(sub_tools) if sub_tools else "Investigated"
+    verbs = {str(facts.get("verb") or "Investigated"), sub_verb}
+    verb = "Updated" if "Updated" in verbs else "Built" if "Built" in verbs else "Investigated"
+    verification = str(facts.get("verification") or "none")
+    sub_verification = _verification_signal(sub_tools, original)
+    if "failed" in (verification, sub_verification):
+      verification = "failed"
+    elif "confirmed" in (verification, sub_verification):
+      verification = "confirmed"
+  else:
+    tools = raw_tools + sub_tools
+    area = _owner_noun(
+      [t.get("input", "") for t in tools] +
+      [sub.get("brief_full", "") for sub in subs])
+    changed = _has_change(tools)
+    verb = _turn_verb(tools)
+    verification = _verification_signal(tools, original)
   if area == "the platform":
     area = (_request_noun(str(raw.get("_first_request") or ""))
             or _request_noun(request_hint) or area)
-  verb = _turn_verb(tools)
   neutral = f"{verb} {area}"
   states = [sub["state"] for sub in subs]
-  verification = _verification_signal(tools, original)
-  changed = _has_change(tools)
 
   flag = None
   if "failed" in states:
@@ -1968,25 +2279,26 @@ def _build_v2_turn(raw: dict, helpers: dict[str, dict],
   # A delivery claim is only a hero line when the evidence supports `done`.
   # Attention/running turns stay neutral and put the caveat in `flag`.
   outcome = delivery if status == "done" and delivery else neutral
-  public_subs = [{k: v for k, v in sub.items() if not k.startswith("_") and
-                  k not in ("did", "report_full", "next", "commands", "ts")}
-                 for sub in subs]
+  public_subs = [{
+    "agent_id": sub["agent_id"], "kind": sub["kind"], "name": sub["name"],
+    "ask": sub["ask"], "state": sub["state"], "depth": sub["depth"],
+    "prompt_available": True,
+  } for sub in subs]
   return {
     "outcome": clip_line(outcome, OUTCOME_CAP), "area": area,
     "result": result, "status": status, "flag": flag,
     "ts": _coerce_iso(raw.get("ts")), "subs": public_subs,
-    "original": original, "commands": _commands_from_tools(tools),
-    "nblocks": int(raw.get("nblocks") or 0),
   }
 
 
 def _trace_turn(run: dict, agents: list[dict]) -> dict:
   tools = [tool for agent in agents for tool in agent.get("tools", [])]
   reports = [agent.get("report_full") or "" for agent in agents if agent.get("report_full")]
+  original = reports[-1] if reports else ""
   return {
     "ts": run.get("started_at") or next((a.get("ts") for a in agents if a.get("ts")), None),
-    "nblocks": len(tools), "_agent_ids": [a["agent_id"] for a in agents],
-    "_tools": [], "_original": reports[-1] if reports else "",
+    "_agent_ids": [a["agent_id"] for a in agents],
+    "_facts": _compact_turn_facts(tools, original), "_original": original,
     "_first_request": "",
   }
 
@@ -2038,7 +2350,7 @@ def build_documents(model: dict, attribution: Attribution, now: float,
                     chat_helpers: Optional[dict[str, list[dict]]] = None,
                     chat_turns: Optional[dict[str, list[dict]]] = None
                     ) -> tuple[dict, dict[str, dict], dict[str, dict], dict[str, dict]]:
-  """Rebuild schema-v2 journal, chat, and globally-addressed helper documents."""
+  """Rebuild schema-v3 journal, chat, and prompt documents."""
   sessions = model["sessions"]
   evidence: dict[str, dict[str, list[dict]]] = {}
   synthetic_turns: dict[str, list[dict]] = {}
@@ -2111,7 +2423,7 @@ def build_documents(model: dict, attribution: Attribution, now: float,
     raw_turns = owner_turns + [turn for turn in synthetic_turns.get(chat_id, [])
                                if any(aid not in referenced for aid in turn.get("_agent_ids", []))]
     stored_title = str(attribution.chats.get(chat_id, {}).get("title") or "Untitled chat")
-    turns = [_build_v2_turn(raw, merged, stored_title) for raw in raw_turns]
+    turns = [_build_v3_turn(raw, merged, stored_title) for raw in raw_turns]
     turns.sort(key=lambda turn: turn.get("ts") or "")
     if not turns:
       continue
@@ -2129,6 +2441,7 @@ def build_documents(model: dict, attribution: Attribution, now: float,
     doc = {
       "schema": SCHEMA_VERSION, "chat_id": chat_id, "provider": provider,
       "title": clip_line(title, 120), "outcome": summary_turn["outcome"],
+      "prompt_full": clip_markdown(first_request, FULL_PROMPT_CAP) or "",
       "ts": ts, "turns": turns,
     }
     chats[chat_id] = doc
@@ -2136,11 +2449,7 @@ def build_documents(model: dict, attribution: Attribution, now: float,
       public_id = helper["agent_id"]
       helpers_out[public_id] = {
         "schema": SCHEMA_VERSION, "agent_id": public_id, "chat_id": chat_id,
-        "kind": helper["kind"], "name": helper["name"], "ask": helper["ask"],
-        "brief_full": helper["brief_full"], "state": helper["state"],
-        "did": helper["did"], "result": helper["result"],
-        "report_full": helper["report_full"], "next": helper["next"],
-        "commands": helper["commands"],
+        "brief_full": helper["brief_full"],
       }
 
   index = _build_index(chats, helpers_out, now)
@@ -2163,28 +2472,22 @@ def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: floa
     task_counts[helper["chat_id"]] = task_counts.get(helper["chat_id"], 0) + 1
   for chat_id, doc in chats.items():
     status, result = _chat_status(doc["turns"])
-    last_turn = doc["turns"][-1]
-    running_turns = [turn for turn in doc["turns"] if turn["status"] == "running"]
-    summary_turn = running_turns[-1] if running_turns else last_turn
     row = {
       "chat_id": chat_id, "provider": doc["provider"], "title": doc["title"],
-      "outcome": doc["outcome"], "area": summary_turn["area"], "result": result,
+      "outcome": doc["outcome"], "result": result,
       "status": status, "tasks": task_counts.get(chat_id, 0), "ts": doc.get("ts"),
     }
     entries.append(row)
     if status != "done":
-      if status == "running":
-        reason = "running"
-      elif result == "not confirmed":
-        reason = "unverified"
-      else:
-        reason = "failed"
       needs_attention.append({
-        "chat_id": chat_id, "title": doc["title"], "reason": reason,
-        "outcome": doc["outcome"], "area": summary_turn["area"], "ts": doc.get("ts"),
+        "chat_id": chat_id, "outcome": doc["outcome"],
       })
   entries.sort(key=lambda row: row.get("ts") or "", reverse=True)
-  needs_attention.sort(key=lambda row: row.get("ts") or "", reverse=True)
+  attention_ids = {row["chat_id"] for row in needs_attention}
+  needs_attention = [
+    {"chat_id": row["chat_id"], "outcome": row["outcome"]}
+    for row in entries if row["chat_id"] in attention_ids
+  ]
   return {"schema": SCHEMA_VERSION, "updated_at": _epoch_to_iso(now),
           "needs_attention": needs_attention, "entries": entries}
 
@@ -2286,18 +2589,18 @@ def flush_documents(index: dict, chats: dict[str, dict],
   over the self-cap. Returns the ordered list of storage paths actually written
   so the caller can log/return exactly what happened."""
   helper_ids = enforce_app_cap(index, chats, helpers, cap_bytes)
-  # Chat summaries remain under the cap, but a sub-card must not advertise a
-  # detail page that was evicted. Preserve the history and disable only the
-  # drill-in affordance for omitted helper documents. Re-evaluate because the
-  # literal `false` is one byte larger than `true`; the cap applies to what is
-  # actually published, including that small shape change.
+  # Chat summaries remain under the cap, but a branch must not advertise a
+  # prompt document that was evicted. Preserve the history and disable only the
+  # disclosure affordance for omitted helper documents. Re-evaluate because
+  # the literal `false` is one byte larger than `true`; the cap applies to the
+  # exact shape that will be published.
   while True:
     retained = set(helper_ids)
     for chat in chats.values():
       for turn in chat.get("turns", []):
         for sub in turn.get("subs", []):
           if sub.get("agent_id") not in retained:
-            sub["tappable"] = False
+            sub["prompt_available"] = False
     revised = enforce_app_cap(index, chats, helpers, cap_bytes)
     if revised == helper_ids:
       break
@@ -2313,11 +2616,14 @@ def flush_documents(index: dict, chats: dict[str, dict],
     digests[path] = digest
     written.append(path)
 
-  _put("index.json", index)
-  for chat_id, doc in chats.items():
-    _put(f"chats/{chat_id}.json", doc)
+  # Publish dependencies before their parents. A failed write can leave an old
+  # index pointing at old-but-valid documents, never a new index pointing at a
+  # chat/helper page that was not written yet.
   for agent_id in helper_ids:
     _put(f"helpers/{agent_id}.json", helpers[agent_id])
+  for chat_id, doc in chats.items():
+    _put(f"chats/{chat_id}.json", doc)
+  _put("index.json", index)
 
   # A page that dropped below the cap this run (or lost its chat) is deleted so
   # the app never serves a stale detail page the roster no longer references.
@@ -2336,7 +2642,7 @@ def enforce_app_cap(index: dict, chats: dict[str, dict],
                     cap_bytes: Optional[int] = None) -> list[str]:
   """Returns the helper ids to keep under `APP_ARTIFACT_CAP_BYTES`.
 
-  Roster (index) + chat summaries are never evicted — only helper detail pages,
+  Roster (index) + chat summaries are never evicted — only helper prompt documents,
   oldest-chat-first (LRU by the chat's last activity), so the app keeps its
   navigable shape and only loses the deepest, oldest detail."""
   limit = APP_ARTIFACT_CAP_BYTES if cap_bytes is None else max(0, cap_bytes)
@@ -2412,11 +2718,10 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   budget = Budget(BUDGET_SECS, BUDGET_BYTES)
   now = time.time()
   model = load_json(state_dir / "model.json", None) or _new_model()
-  migrating_v2 = model.get("schema") != SCHEMA_VERSION
-  # The trace accumulator is forward-compatible, but cached chat turns are not:
-  # v1 stored rail nodes/gists while v2 needs bounded raw tool evidence. Keep the
-  # expensive trace model, mark it migrated, and force only owner-chat blocks to
-  # be walked again below.
+  previous_schema = model.get("schema")
+  reset_owner_state = previous_schema not in (2, SCHEMA_VERSION)
+  # Trace accumulators are forward-compatible. v2 owner turns are migrated in
+  # place below; only pre-v2 rail/gist caches require a bounded owner-chat rescan.
   model["schema"] = SCHEMA_VERSION
   cursors = CursorStore(state_dir / "cursors.json")
   digests = load_json(state_dir / "digests.json", {})
@@ -2443,6 +2748,14 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   chats_ok, chats_meta = fetch_chats(base_url, service_token)
   if not (links_ok and chats_ok):
     reason = _degraded_reason(service_token, links_ok, chats_ok)
+    # A pre-v2 owner cache still needs its one-time reset on the first healthy
+    # run. Do not let a degraded trace-only slice advance the shared model
+    # marker and accidentally make that later run treat the old cache as v3.
+    if reset_owner_state:
+      if previous_schema is None:
+        model.pop("schema", None)
+      else:
+        model["schema"] = previous_schema
     save_json(state_dir / "model.json", model)
     cursors.save()
     return {
@@ -2460,13 +2773,22 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   # Helpers the chats record about themselves. This runs every slice (not only
   # when the trace side wants attribution) because it is the only route that
   # covers a chat whose helper traces have already aged off disk.
-  helper_scanned = load_json(state_dir / "scanned-chat-helpers.json", {})
-  chat_helpers_state = load_json(state_dir / "chat-helpers.json", {})
+  # Schema v3 uses a fresh progressive cursor. Besides avoiding any assumptions
+  # about the old cache shape, this one-time backfill re-reads historical owner
+  # prompts with FULL_PROMPT_CAP instead of preserving v2's report-sized cap.
+  helper_scanned_path = state_dir / "scanned-chat-helpers-v3.json"
+  helper_scanned = load_json(helper_scanned_path, {})
+  chat_helpers_state = _clean_chat_helpers_state(
+    load_json(state_dir / "chat-helpers.json", {}))
   chat_turns_state = load_json(state_dir / "chat-turns.json", {})
-  if migrating_v2:
+  if reset_owner_state:
     helper_scanned = {}
     chat_helpers_state = {}
     chat_turns_state = {}
+  else:
+    # Idempotent shape migration: safe even if a previous degraded run updated
+    # model.json before owner API access returned and the turn cache was saved.
+    chat_turns_state = _compact_chat_turns_state(chat_turns_state)
   new_helpers, new_turns, rescanned = scan_chat_helpers(
     base_url, service_token, chats_meta, helper_scanned, budget)
   chat_helpers_state.update(new_helpers)
@@ -2495,7 +2817,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   save_json(state_dir / "digests.json", digests)
   save_json(state_dir / "scanned-chats.json", scanned)
   save_json(state_dir / "tooluse-map.json", tooluse_map)
-  save_json(state_dir / "scanned-chat-helpers.json", helper_scanned)
+  save_json(helper_scanned_path, helper_scanned)
   save_json(state_dir / "chat-helpers.json", chat_helpers_state)
   save_json(state_dir / "chat-turns.json", chat_turns_state)
 
@@ -2526,14 +2848,13 @@ def _mark_expired_sources(model: dict, cc_dir: Path, codex_home: Path) -> None:
   """Marks a helper `source_expired` when its digest exists but the raw trace
   file is gone (log rotation / cleanup). We keep the digest — the app can still
   show what it knew — but the status derivation degrades to `unavailable`."""
-  for akey, agent in model["agents"].items():
-    sid, agent_id = agent["sid"], agent["agent_id"]
+  for agent in model["agents"].values():
+    sid = agent["sid"]
     if agent["run_kind"] == "collab":
       # Codex helper trace is the rollout itself; presence-check is cheap enough
       # to skip here (rollouts are dated dirs), so leave collab as-is.
       continue
-    if not _claude_trace_exists(cc_dir, sid, agent):
-      agent["source_expired"] = True
+    agent["source_expired"] = not _claude_trace_exists(cc_dir, sid, agent)
 
 
 def _claude_trace_exists(cc_dir: Path, sid: str, agent: dict) -> bool:
@@ -2576,6 +2897,7 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                 "message": {"role": "assistant",
                             "content": [{"type": "text", "text":
                                          f"Root cause found: token {fake_secret} in log."}],
+                            "stop_reason": "end_turn",
                             "usage": {"input_tokens": 5, "output_tokens": 40}}}),
   ]) + "\n")
   # a workflow run: record + phases + one journal-completed agent.
@@ -2626,7 +2948,11 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
                 "payload": {"type": "function_call", "name": "shell",
                             "arguments": "{\"command\": \"pytest\"}"}}),
     json.dumps({"timestamp": "2026-07-17T12:05:02Z", "type": "event_msg",
-                "payload": {"type": "agent_message", "message": "Refactor complete, tests pass."}}),
+                "payload": {"type": "agent_message", "phase": "final_answer",
+                            "message": "Refactor complete, tests pass."}}),
+    json.dumps({"timestamp": "2026-07-17T12:05:03Z", "type": "event_msg",
+                "payload": {"type": "task_complete",
+                            "last_agent_message": "Refactor complete, tests pass."}}),
   ]) + "\n")
   return cc, codex
 
@@ -2660,10 +2986,19 @@ def selftest() -> int:
     chats_meta = {"chatA": {"title": "Fix flaky test", "provider": "claude"},
                   "chatC": {"title": "Refactor parser", "provider": "codex"}}
     attribution = Attribution(links, {"toolu_TASKA": "chatA"}, chats_meta)
-    index, chats, helpers, unlinked = build_documents(model, attribution, now)
+    fixture_request = "Please fix the flaky test and verify the result."
+    index, chats, helpers, unlinked = build_documents(
+      model, attribution, now,
+      chat_turns={"chatA": [{
+        "_agent_ids": ["taskA"], "_tools": [], "_original": "Investigation started.",
+        "_first_request": fixture_request, "ts": "2026-07-17T10:00:00Z", "nblocks": 1,
+      }]})
 
     sink = DictSink()
     written = flush_documents(index, chats, helpers, sink, {})
+    _assert(written and written[-1] == "index.json"
+            and all(path.startswith("helpers/") for path in written[:len(helpers)]),
+            f"leaf documents publish before index: {written[:3]} … {written[-1:]}")
 
     # --- schema-shape asserts (json-schema-ish) ---
     _assert(index["schema"] == SCHEMA_VERSION, "index schema")
@@ -2673,22 +3008,26 @@ def selftest() -> int:
     _assert(len(index["entries"]) == 2,
             f"expected 2 chats, got {len(index['entries'])}")
     for row in index["entries"]:
-      _assert(set(row) == {"chat_id", "provider", "title", "outcome", "area",
+      _assert(set(row) == {"chat_id", "provider", "title", "outcome",
                            "result", "status", "tasks", "ts"},
               f"index entry keys: {set(row)}")
+    for row in index["needs_attention"]:
+      _assert(set(row) == {"chat_id", "outcome"},
+              f"attention entry keys: {set(row)}")
 
     doc_a = chats["chatA"]
     _assert(doc_a["provider"] == "claude", "chatA provider")
     _assert(set(doc_a) == {"schema", "chat_id", "provider", "title", "outcome",
-                           "ts", "turns"}, f"chat keys: {set(doc_a)}")
+                           "prompt_full", "ts", "turns"}, f"chat keys: {set(doc_a)}")
+    _assert(doc_a["prompt_full"] == fixture_request, "root prompt is published")
     _assert(doc_a["turns"], "chat has derived turns")
     for turn in doc_a["turns"]:
       _assert(set(turn) == {"outcome", "area", "result", "status", "flag", "ts",
-                            "subs", "original", "commands", "nblocks"},
+                            "subs"},
               f"turn keys: {set(turn)}")
       for sub in turn["subs"]:
-        _assert(set(sub) == {"agent_id", "kind", "name", "ask", "state", "acts",
-                             "result", "brief_full", "tappable"},
+        _assert(set(sub) == {"agent_id", "kind", "name", "ask", "state",
+                             "depth", "prompt_available"},
                 f"sub keys: {set(sub)}")
 
     doc_c = chats["chatC"]
@@ -2698,20 +3037,26 @@ def selftest() -> int:
 
     # --- product-truth asserts ---
     page = sink.docs["helpers/wfB.json"]
-    _assert(set(page) == {"schema", "agent_id", "chat_id", "kind", "name", "ask",
-                          "brief_full", "state", "did", "result", "report_full",
-                          "next", "commands"}, f"helper page keys: {set(page)}")
-    for step in page["did"]:
-      _assert(set(step) == {"verb", "label", "count"}, f"did keys: {set(step)}")
+    _assert(set(page) == {"schema", "agent_id", "chat_id", "brief_full"},
+            f"helper prompt keys: {set(page)}")
     # secret scrubbing reached the task agent's final report/outcome.
     task_page = sink.docs["helpers/taskA.json"]
     secret_prefix = "sk-" + "ant-SECRET"
     _assert(secret_prefix not in json.dumps(task_page), "secret scrubbed from helper page")
     _assert(secret_prefix not in json.dumps(index), "secret scrubbed from index")
+    task_agent = model["agents"][f"{claude_sid}::taskA"]
+    _assert(task_agent["final_report_terminal"] is True,
+            "Claude end_turn marks a terminal report")
+    task_agent["source_expired"] = True
+    _mark_expired_sources(model, cc, codex)
+    _assert(task_agent["source_expired"] is False,
+            "a returned source clears the expired marker")
 
     # child inherited the parent's chat via parent_thread_id.
     child_agent_ids = {sub["agent_id"] for turn in doc_c["turns"] for sub in turn["subs"]}
     _assert("019f0000-child0" in child_agent_ids, "codex child linked to parent chat")
+    _assert(model["agents"]["019f0000-child0::019f0000-child0"]["final_report_terminal"] is True,
+            "Codex task_complete marks a terminal report")
 
     # === finding-specific asserts =========================================
 
@@ -2723,6 +3068,54 @@ def selftest() -> int:
             "unslashed 36-char token still redacted")
     _assert("[redacted-jwt]" in scrub("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123456"),
             "JWT still redacted after divergence")
+    summary = _plain_ask(
+      "You are a READ-ONLY auditor inside a live instance.",
+      "You are a READ-ONLY auditor. Never modify anything.\n\n"
+      "PRIORITY TRACK — Diagnose why app-store updates are failing.\n"
+      "1. Find the update mechanism.")
+    _assert(summary == "Diagnose why app-store updates are failing.",
+            f"policy preamble is removed from task summary: {summary!r}")
+    subsystem_summary = _plain_ask(
+      "Be concrete: every finding needs file and line evidence.",
+      "You are a READ-ONLY code reviewer. Do not edit.\n\n"
+      "Be concrete: every finding needs file and line evidence.\n\n"
+      "Subsystem: shell frontend. Explore /data/shell/src and compare it to the spec.")
+    _assert(subsystem_summary == "Shell frontend.",
+            f"explicit subsystem beats reusable review instructions: {subsystem_summary!r}")
+    finding_summary = _plain_ask("{", (
+      "You are an adversarial verifier. The reviewer reported this finding:\n\n"
+      '{"title":"Queued messages can disappear during restart",'
+      '"severity":"high","evidence":"repro"}'))
+    _assert(finding_summary == "Verify Queued messages can disappear during restart",
+            f"structured finding title becomes the task summary: {finding_summary!r}")
+    place_summary = _plain_ask(
+      "Adversarially fact-check this Sarajevo dining spot.",
+      'Fact-check the claim. Place: {"name":"Aščinica ASDŽ",'
+      '"category":"home cooking"}. Be skeptical.')
+    _assert(place_summary == "Fact-check Aščinica ASDŽ",
+            f"structured place name disambiguates repeated tasks: {place_summary!r}")
+    _assert(_task_summary("{\n}\n") == "",
+            "punctuation-only prompt lines are never published as summaries")
+    _assert(helper_from_agent_block({
+      "type": "tool", "tool": "Task", "tool_use_id": "call-placeholder",
+      "input": "Working in the background", "output": "", "status": "done",
+    }) is None, "empty background placeholder is not published as a helper")
+    _assert(helper_from_agent_block({
+      "type": "tool", "tool": "Task", "tool_use_id": "call-empty",
+      "input": "", "output": "", "status": "done",
+    }) is None, "empty task shell is not published as a helper")
+    _assert(_clean_chat_helpers_state({"chat": [{
+      "agent_id": "call_placeholder", "description": None,
+      "_brief_full": "", "_full_outcome": None,
+    }]}) == {}, "cached background placeholder is removed during migration")
+    long_prompt = "Inspect the complete evidence.\n\n" + ("detail " * 300)
+    _assert((clip_markdown(long_prompt, FULL_PROMPT_CAP) or "") == long_prompt.strip(),
+            "full helper prompt is retained below the safety cap")
+    _assert(len((clip_markdown("🛠" * 100, 64) or "").encode("utf-8")) <= 64,
+            "markdown caps are byte-accurate for multibyte prompts")
+    long_root = "Please inspect the complete workflow.\n\n" + ("context " * 1800)
+    _assert(_owner_request(long_root) == long_root.strip(),
+            "root prompt no longer passes through the smaller report cap")
 
     # Free-text title derivation is scrubbed and ends on a word boundary.
     derived_title = _title_from_request(
@@ -2800,10 +3193,57 @@ def selftest() -> int:
     _assert(cached_ack_ev["state"] == "running" and not cached_ack_ev["report_full"],
             f"cached launch envelope is normalized: {cached_ack_ev}")
 
+    trace_now = 1_800_000_000.0
+    # Procedural prose is not terminal evidence. This covers both freshly
+    # parsed traces and cached v2 block records that predate terminal markers.
+    progress = "I have good coverage. Let me verify one final detail."
+    _assert(derive_status({"final_report": progress, "has_activity": True}, trace_now)
+            == "stopped", "cached progress text is stopped")
+    _assert(derive_status({"final_report": progress, "has_activity": True,
+                           "final_report_terminal": False}, trace_now) == "stopped",
+            "explicit non-terminal text is stopped")
+    _assert(derive_status({"final_report": "Review complete.", "has_activity": True,
+                           "final_report_terminal": True}, trace_now) == "finished",
+            "explicit terminal report is finished")
+    _assert(derive_status({"final_report": "Review complete.", "has_activity": True,
+                           "final_report_terminal": True, "interrupted": True}, trace_now)
+            == "stopped", "later interruption supersedes report text")
+    _assert(derive_status({"result": "failed", "last_ts": _epoch_to_iso(trace_now)}, trace_now)
+            == "failed", "string failure overrides freshness")
+    _assert(derive_status({"result": {"collab_status": "cancelled"},
+                           "last_ts": _epoch_to_iso(trace_now)}, trace_now)
+            == "stopped", "cancelled collab result overrides freshness")
+    _assert(derive_status({"result": {"collab_status": "completed"}}, trace_now)
+            == "finished", "completed collab result is terminal success")
+    cached_progress_ev = _block_evidence({
+      "agent_id": "cached-progress", "status": "finished", "_full_outcome": progress,
+      "description": "Review storage"}, "claude")
+    _assert(cached_progress_ev["state"] == "stopped",
+            "cached progress block is stopped")
+    _assert(not _is_fresh(_epoch_to_iso(trace_now + FUTURE_SKEW_SECS + 1), trace_now),
+            "far-future timestamps are not fresh")
+    interrupted_trace = root / "interrupted-agent.jsonl"
+    _write(interrupted_trace, "\n".join([
+      json.dumps({"timestamp": _epoch_to_iso(trace_now - 30),
+                  "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Now let me inspect the next file."}]}}),
+      json.dumps({"timestamp": _epoch_to_iso(trace_now - 20),
+                  "message": {"role": "user", "content": "[Request interrupted by user]"}}),
+    ]) + "\n")
+    interrupted_model = _new_model()
+    interrupted_agent = _agent(
+      interrupted_model, "interrupt-sid", "tasks", "interrupt-agent", "tasks")
+    interrupted_agent["goal"] = "Test interruption handling"
+    _fold_agent_transcript(
+      interrupted_trace, interrupted_agent, interrupted_model, "interrupt-sid",
+      CursorStore(root / "interrupt-cursors.json"), Budget(BUDGET_SECS, BUDGET_BYTES))
+    _assert(interrupted_agent["interrupted"] is True
+            and derive_status(interrupted_agent, trace_now) == "stopped",
+            "Claude interruption marker produces stopped lifecycle")
+
     # A trace holding only a launch receipt stays running while fresh, then
     # becomes stopped rather than remaining green forever. The receipt itself
     # is never exposed as a report.
-    trace_now = 1_800_000_000.0
     trace_ack = {
       "agent_id": "trace-bg", "description": "Review storage", "goal": "Review storage",
       "steps": [],
@@ -2825,7 +3265,7 @@ def selftest() -> int:
                     report_full="Done. Parser check completed.")
     joined = _merge_evidence([block_ev, trace_ev], "claude")
     _assert(joined["state"] == "done", f"terminal evidence wins: {joined['state']}")
-    joined_turn = _build_v2_turn({
+    joined_turn = _build_v3_turn({
       "_agent_ids": ["joined"], "_tools": [], "_original": "Done.",
       "ts": 1_700_000_000_000, "nblocks": 1}, {"joined": joined})
     _assert(joined_turn["subs"][0]["state"] == "done",
@@ -2835,8 +3275,8 @@ def selftest() -> int:
     # no longer present a broken detail-page affordance for that helper.
     cap_index = {"entries": [{"chat_id": "cap", "ts": "2026-07-17T00:00:00Z"}]}
     cap_chats = {"cap": {"turns": [{"subs": [
-      {"agent_id": "kept", "tappable": True},
-      {"agent_id": "evicted", "tappable": True},
+      {"agent_id": "kept", "prompt_available": True},
+      {"agent_id": "evicted", "prompt_available": True},
     ]}]}}
     cap_helpers = {
       "kept": {"chat_id": "cap", "payload": "k" * 100},
@@ -2848,8 +3288,9 @@ def selftest() -> int:
     cap_sink = DictSink()
     flush_documents(cap_index, cap_chats, cap_helpers, cap_sink, {}, cap_base + cap_one + 1)
     cap_subs = cap_sink.docs["chats/cap.json"]["turns"][0]["subs"]
-    _assert(cap_subs[0]["tappable"] is True and cap_subs[1]["tappable"] is False,
-            f"evicted detail is not tappable: {cap_subs}")
+    _assert(cap_subs[0]["prompt_available"] is True
+            and cap_subs[1]["prompt_available"] is False,
+            f"evicted prompt is not advertised: {cap_subs}")
     _assert("helpers/kept.json" in cap_sink.docs
             and "helpers/evicted.json" not in cap_sink.docs,
             "cap stores only the retained helper page")
@@ -2873,13 +3314,28 @@ def selftest() -> int:
     beat_helpers, beat_raw_turns = _walk_chat(beat_messages, scope="beat-chat")
     beat_merged = {h["agent_id"]: _merge_evidence([_block_evidence(h, "claude")], "claude")
                    for h in beat_helpers}
-    beat_turn = _build_v2_turn(beat_raw_turns[0], beat_merged)
+    beat_turn = _build_v3_turn(beat_raw_turns[0], beat_merged)
     _assert(beat_turn["status"] == "attention" and beat_turn["result"] == "not confirmed",
             f"Beat validator truth gate: {beat_turn}")
     _assert(beat_turn["outcome"] == "Investigated Beat Machine",
             f"Beat validator neutral outcome: {beat_turn['outcome']}")
-    _assert(beat_turn["original"].startswith("The validator checks for export default OR export{"),
-            "Beat validator original preserved")
+    legacy_beat = {
+      "ts": beat_raw_turns[0]["ts"], "_agent_ids": beat_raw_turns[0]["_agent_ids"],
+      "_tools": [{
+        "tool": "Bash", "status": "done",
+        "input": "curl $API_BASE_URL/api/apps/10/validate",
+        "output": '{"valid": false, "issues": ["no default export"]}',
+      }],
+      "_original": beat_raw_turns[0]["_original"],
+      "_first_request": "Please update Beat Machine",
+    }
+    migrated_beat = _compact_chat_turn(legacy_beat, keep_request=True)
+    migrated_turn = _build_v3_turn(migrated_beat, beat_merged)
+    _assert("_tools" not in migrated_beat and migrated_beat.get("_facts"),
+            f"v2 turn migrates without raw tools: {migrated_beat.keys()}")
+    _assert((migrated_turn["status"], migrated_turn["result"], migrated_turn["area"])
+            == (beat_turn["status"], beat_turn["result"], beat_turn["area"]),
+            f"compaction preserves turn truth: {migrated_turn} vs {beat_turn}")
 
     # Missing verification is the normal case: a plain reported edit stays
     # done, while positive doubt in the agent's own words remains amber.
@@ -2890,13 +3346,13 @@ def selftest() -> int:
       "_original": "Updated Beat Machine with the requested controls.",
       "ts": 1_700_000_000_000, "nblocks": 1,
     }
-    ordinary_turn = _build_v2_turn(ordinary_raw, {})
+    ordinary_turn = _build_v3_turn(ordinary_raw, {})
     _assert(ordinary_turn["status"] == "done" and ordinary_turn["result"] == "done",
             f"untested ordinary edit stays done: {ordinary_turn}")
     hedged_raw = dict(
       ordinary_raw,
       _original="Updated Beat Machine. It should load fine.")
-    hedged_turn = _build_v2_turn(hedged_raw, {})
+    hedged_turn = _build_v3_turn(hedged_raw, {})
     _assert(hedged_turn["status"] == "attention"
             and hedged_turn["result"] == "not confirmed",
             f"agent hedge stays attention: {hedged_turn}")
@@ -2926,6 +3382,13 @@ def selftest() -> int:
     _assert(deg["writes"] == 0, "degraded run writes nothing")
     _assert(not (deg_state / "digests.json").exists(),
             "degraded run leaves owner-derived state (digests) untouched")
+    old_deg_state = root / "old-deg-state"; old_deg_state.mkdir()
+    old_model = _new_model(); old_model["schema"] = 1
+    save_json(old_deg_state / "model.json", old_model)
+    save_json(old_deg_state / "chat-turns.json", {"legacy": [{"rail": []}]})
+    run_refresh(cc, codex, old_deg_state, "http://127.0.0.1:1", "appX", "apptok", "")
+    _assert(load_json(old_deg_state / "model.json", {}).get("schema") == 1,
+            "degraded pre-v2 run preserves the reset marker for its next retry")
 
     # #4: charge only consumed bytes; a partial tail is left for the next run.
     pf = root / "partial.jsonl"
@@ -2998,8 +3461,10 @@ def selftest() -> int:
     print("SELFTEST OK")
     print(f"  chats={len(index['entries'])} unlinked={len(unlinked)} "
           f"helpers={len(helpers)} writes={len(written)}")
-    print(f"  helper kinds={sorted({page['kind'] for page in helpers.values()})}")
-    print(f"  scrubbed report_full(taskA)={task_page['report_full']!r}")
+    kinds = {sub["kind"] for doc in chats.values() for turn in doc["turns"]
+             for sub in turn["subs"]}
+    print(f"  helper kinds={sorted(kinds)}")
+    print(f"  task prompt chars={len(task_page['brief_full'])}")
     return 0
 
 

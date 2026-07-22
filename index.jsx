@@ -6,11 +6,11 @@
 //   domain.js         — pure derive/format/order helpers (the testable core)
 //   theme.js          — the single app stylesheet (CSS string)
 //   views/Home.jsx        — chats with background work
-//   views/ChatDetail.jsx  — one chat's runs, plans, and helper cards
-//   views/HelperDetail.jsx— one helper's goal, steps, and report
+//   views/ChatDetail.jsx  — one chat's prompt-and-branches timeline
 //
-// App holds the three-level navigation (home → chat → helper), subscribes to
-// index.json so it repaints when the job writes, and drives on-demand refresh.
+// App holds the two-level navigation (journal → layered chat timeline),
+// subscribes to index.json so it repaints when the job writes, and drives
+// on-demand refresh.
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { CSS } from './theme.js'
@@ -18,7 +18,6 @@ import { makeStorage, useOnline } from './storage.js'
 import { isStale, relativeTime } from './domain.js'
 import { Home } from './views/Home.jsx'
 import { ChatDetail } from './views/ChatDetail.jsx'
-import { HelperDetail } from './views/HelperDetail.jsx'
 
 // Await a nav-open handle across runtime versions: the newer `outcome` API
 // carries a status ('owned'/'standalone' both mean render the view); the older
@@ -49,13 +48,11 @@ export default function App({ appId, token }) {
   const [refreshing, setRefreshing] = useState(false)
 
   const [chat, setChat] = useState(null)         // { chatId, meta } | null
-  const [helper, setHelper] = useState(null)     // { chatId, agentId, meta } | null
 
   const chatNavRef = useRef(null)
-  const helperNavRef = useRef(null)
-  // Per-chat view state (scroll position + open disclosures), keyed by chatId.
-  // Lives here so it outlives ChatDetail's unmount when a helper is opened, so
-  // returning lands on the same scroll position with the same rows expanded.
+  // Per-chat view state (scroll position + open prompt disclosures), keyed by
+  // chatId. Keeping it here preserves the user's place when they return to the
+  // journal and later reopen the same workflow.
   const chatViewStates = useRef(new Map())
   const autoRefreshedRef = useRef(false)
   const readyRef = useRef(false)
@@ -146,7 +143,6 @@ export default function App({ appId, token }) {
     if (window.mobius && window.mobius.nav && typeof window.mobius.nav.open === 'function') {
       const handle = window.mobius.nav.open('workflows-chat', () => {
         chatNavRef.current = null
-        setHelper(null)
         setChat(null)
       })
       chatNavRef.current = handle
@@ -164,38 +160,11 @@ export default function App({ appId, token }) {
     const h = chatNavRef.current
     chatNavRef.current = null
     try { if (h && h.close) h.close() } catch (_) { /* noop */ }
-    setHelper(null)
     setChat(null)
-  }, [])
-
-  const openHelper = useCallback(async (chatId, agent) => {
-    if (!agent || !agent.agent_id) return
-    if (window.mobius && window.mobius.nav && typeof window.mobius.nav.open === 'function') {
-      const handle = window.mobius.nav.open('workflows-helper', () => {
-        helperNavRef.current = null
-        setHelper(null)
-      })
-      helperNavRef.current = handle
-      const okNav = await awaitNav(handle)
-      if (helperNavRef.current !== handle) return
-      if (!okNav) { helperNavRef.current = null; return }
-    }
-    setHelper({ chatId, agentId: agent.agent_id, meta: agent })
-    if (window.mobius && typeof window.mobius.signal === 'function') {
-      window.mobius.signal('helper_opened')
-    }
-  }, [])
-
-  const closeHelper = useCallback(() => {
-    const h = helperNavRef.current
-    helperNavRef.current = null
-    try { if (h && h.close) h.close() } catch (_) { /* noop */ }
-    setHelper(null)
   }, [])
 
   // Tear down any open nav surfaces on unmount.
   useEffect(() => () => {
-    try { if (helperNavRef.current && helperNavRef.current.close) helperNavRef.current.close() } catch (_) { /* noop */ }
     try { if (chatNavRef.current && chatNavRef.current.close) chatNavRef.current.close() } catch (_) { /* noop */ }
   }, [])
 
@@ -219,17 +188,7 @@ export default function App({ appId, token }) {
     : 'Not run yet'
 
   let view
-  if (helper) {
-    view = (
-      <HelperDetail
-        storage={storage}
-        chatId={helper.chatId}
-        agentId={helper.agentId}
-        agentMeta={helper.meta}
-        onBack={closeHelper}
-      />
-    )
-  } else if (chat) {
+  if (chat) {
     view = (
       <ChatDetail
         storage={storage}
@@ -237,7 +196,6 @@ export default function App({ appId, token }) {
         chatMeta={chat.meta}
         viewStates={chatViewStates.current}
         onBack={closeChat}
-        onOpenHelper={openHelper}
         onOpenChat={openShellChat}
       />
     )
@@ -252,7 +210,6 @@ export default function App({ appId, token }) {
         updatedLabel={updatedLabel}
         onRefresh={doRefresh}
         onOpenDetail={openDetail}
-        onOpenChat={openShellChat}
       />
     )
   }

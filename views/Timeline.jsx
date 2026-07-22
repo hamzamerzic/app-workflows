@@ -1,139 +1,141 @@
-// Timeline — a chat rendered as a clean vertical turn-spine (replacing the old
-// git-graph SVG rail). Each turn is a node on the spine with its plain outcome,
-// an area/result meta line, an optional amber flag ("needs a look"), then the
-// subagent cards it spawned — each with an avatar by kind, "Asked to:", a
-// friendly action strip, and a one-line result — and finally a per-turn
-// "Technical detail" disclosure holding the agent's own words + raw commands.
+// Timeline — a skim-first execution tree.
 //
-// Honesty: the outcome, result, and the subagents' asks/results are the parser's
-// plain-language restatement; the agent's VERBATIM words live under Technical
-// detail (rendered via Markdown). Missing values are omitted, never faked.
-//
-// Disclosure state (which turns have Technical detail open) lives in a passed-in
-// per-chat store so it — and the scroll position — survive a drill-in to a
-// subagent and back (see ChatDetail's scroll/disclosure restoration).
+// Main-agent turns stay on one vertical trunk. Helpers branch from the turn
+// that spawned them. The closed state shows only who did what and whether it
+// completed; opening a helper reveals its full assignment inline. Tool calls,
+// command lists, and raw execution prose are intentionally absent here.
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Markdown } from './Markdown.jsx'
-import { statusDot, avatarFor, subStateMeta } from '../domain.js'
+import { avatarFor, subStateMeta } from '../domain.js'
 
-function SubCard({ sub, onOpen }) {
+function turnState(turn) {
+  if (turn.status === 'running') return 'running'
+  if (turn.status === 'done') return 'done'
+  if (turn.result === "couldn't complete") return 'failed'
+  return 'stopped'
+}
+
+function repeatsOutcome(area, outcome) {
+  const normalize = (value) => String(value || '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+  const needle = normalize(area)
+  return Boolean(needle && normalize(outcome).includes(needle))
+}
+
+function Branch({ sub, branchKey, store, storage }) {
   const av = avatarFor(sub.kind)
   const name = sub.name || av.name
-  const st = subStateMeta(sub.state)
-  const acts = Array.isArray(sub.acts) ? sub.acts : []
-  const tappable = sub.tappable === true && !!sub.agent_id
+  const state = subStateMeta(sub.state)
+  const canOpen = sub.prompt_available !== false && Boolean(storage && sub.agent_id)
+  const depth = Math.min(3, Math.max(1, Number(sub.depth) || 1))
+  const [open, setOpen] = useState(() => store.prompts.has(branchKey))
+  const [fullPrompt, setFullPrompt] = useState(null)
+
+  // Chat documents intentionally carry only the one-line summary. Fetch the
+  // full prompt document only after the owner opens this branch.
+  useEffect(() => {
+    if (!open || fullPrompt !== null || !storage || !sub.agent_id) return undefined
+    let cancelled = false
+    storage.getJSON(`helpers/${sub.agent_id}.json`).then((doc) => {
+      if (cancelled) return
+      const value = doc && typeof doc.brief_full === 'string' ? doc.brief_full.trim() : ''
+      setFullPrompt(value)
+    })
+    return () => { cancelled = true }
+  }, [open, fullPrompt, storage, sub.agent_id])
+
+  const awaitingPrompt = open && fullPrompt === null && Boolean(storage && sub.agent_id)
 
   const inner = (
     <>
-      <div className="wf-sub-top">
-        <span className={`wf-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
-        <span className="wf-sub-id">
-          <span className="wf-sub-name">{name}</span>
-          <span className="wf-sub-kind">{av.role}</span>
-        </span>
-        <span className={`wf-sub-state ${st.cls}`}>{st.glyph} {st.label}</span>
-      </div>
-      {sub.ask && <div className="wf-sub-ask"><span className="k">Asked to:</span> {sub.ask}</div>}
-      {acts.length > 0 && (
-        <div className="wf-strip">
-          {acts.map((a, i) => <span className="wf-act" key={i}>{a}</span>)}
-        </div>
-      )}
-      {sub.result && <div className="wf-sub-res">{sub.result}</div>}
-      {tappable && <span className="wf-sub-open" aria-hidden="true">›</span>}
+      <span className={`wf-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
+      <span className="wf-branch-copy">
+        <span className="wf-branch-name">{depth > 1 ? 'Nested helper' : name}</span>
+        <span className="wf-branch-ask">{sub.ask || 'No task summary was recorded'}</span>
+      </span>
+      <span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span>
+      {canOpen && <span className="wf-branch-chevron" aria-hidden="true">›</span>}
     </>
   )
 
-  return tappable
-    ? (
-      <button type="button" className="wf-sub is-tap" onClick={onOpen} aria-label={`Open subagent: ${sub.ask || name}`}>
-        {inner}
-      </button>
-    )
-    : <div className="wf-sub">{inner}</div>
-}
-
-function TurnNode({ turn, turnKey, chatId, onOpenHelper, store }) {
-  const subs = Array.isArray(turn.subs) ? turn.subs : []
-  const commands = Array.isArray(turn.commands) ? turn.commands : []
-  const original = (typeof turn.original === 'string') ? turn.original.trim() : ''
-  const hasTech = !!original || commands.length > 0
-  // A flagged turn always reads as "needs a look", even if status drifts.
-  const dot = turn.flag ? 'attn' : statusDot(turn.status)
-
-  const [techOpen, setTechOpen] = useState(() => store.tech.has(turnKey))
-  const onTechToggle = (e) => {
-    const open = e.currentTarget.open
-    setTechOpen(open)
-    if (open) store.tech.add(turnKey); else store.tech.delete(turnKey)
-  }
-
   return (
-    <div className="wf-turn">
-      <span className={`wf-tnode ${dot}`} aria-hidden="true"><i /></span>
-      {turn.outcome && <div className="wf-toutcome">{turn.outcome}</div>}
-      {(turn.area || turn.result) && (
-        <div className="wf-tmeta">
-          {turn.area && <span className="wf-pill is-area">{turn.area}</span>}
-          {turn.area && turn.result && <span className="wf-sep" aria-hidden="true" />}
-          {turn.result && <span>{turn.result}</span>}
-        </div>
-      )}
-      {turn.flag && (
-        <div className="wf-tflag">
-          <span className="wf-tflag-ic" aria-hidden="true">⚠</span>
-          <span>{turn.flag}</span>
-        </div>
-      )}
-
-      {subs.map((sub, si) => (
-        <SubCard
-          key={sub.agent_id || si}
-          sub={sub}
-          onOpen={() => onOpenHelper(chatId, { agent_id: sub.agent_id, description: sub.ask })}
-        />
-      ))}
-
-      {hasTech && (
-        <details className="wf-tech" open={techOpen} onToggle={onTechToggle}>
-          <summary className="wf-tech-sum">
-            <span className="wf-cx" aria-hidden="true">›</span> Technical detail
-          </summary>
-          <div className="wf-techbox">
-            {original && (
-              <>
-                <div className="wf-techbox-lbl">The assistant’s own words</div>
-                <div className="wf-orig"><Markdown text={original} /></div>
-              </>
-            )}
-            {commands.length > 0 && (
-              <div className="wf-cmds">
-                {commands.map((c, ci) => <div className="wf-cmd" key={ci}>{c}</div>)}
-              </div>
-            )}
-          </div>
+    <div className="wf-branch" role="listitem" style={{ '--wf-branch-depth': depth - 1 }}>
+      <span className="wf-branch-line" aria-hidden="true" />
+      {canOpen ? (
+        <details
+          className="wf-branch-detail"
+          open={open}
+          onToggle={(event) => {
+            const next = event.currentTarget.open
+            setOpen(next)
+            if (next) store.prompts.add(branchKey)
+            else store.prompts.delete(branchKey)
+          }}
+        >
+          <summary className="wf-branch-summary">{inner}</summary>
+          {open && (
+            <div className="wf-branch-prompt">
+              <div className="wf-flow-label">Full prompt</div>
+              {awaitingPrompt
+                ? <div className="wf-prompt-loading" role="status">Loading full prompt…</div>
+                : fullPrompt
+                  ? <Markdown text={fullPrompt} />
+                  : <div className="wf-prompt-loading">Prompt unavailable.</div>}
+            </div>
+          )}
         </details>
+      ) : (
+        <div className="wf-branch-summary is-static">{inner}</div>
       )}
     </div>
   )
 }
 
-export function Timeline({ turns, chatId, onOpenHelper, store }) {
-  const list = Array.isArray(turns) ? turns : []
-  // Fallback store so the component still renders standalone (no drill-in
-  // persistence, but no crash) if a caller omits the per-chat store.
-  const s = store && store.tech ? store : { tech: new Set() }
+function Turn({ turn, turnKey, store, storage }) {
+  const subs = Array.isArray(turn.subs) ? turn.subs : []
+  const state = subStateMeta(turnState(turn))
+  const showArea = turn.area && !repeatsOutcome(turn.area, turn.outcome)
   return (
-    <div className="wf-spine">
-      {list.map((t, i) => (
-        <TurnNode
-          key={i}
-          turn={t}
-          turnKey={String(i)}
-          chatId={chatId}
-          onOpenHelper={onOpenHelper}
-          store={s}
+    <section className="wf-flow-turn">
+      <span className={`wf-flow-node ${state.cls}`} aria-hidden="true" />
+      <div className="wf-turn-main">
+        <div className="wf-toutcome">{turn.outcome || 'Continued the task'}</div>
+        <div className="wf-turn-meta">
+          {showArea && <span>{turn.area}</span>}
+          {showArea && <span className="wf-sep" aria-hidden="true" />}
+          <span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span>
+        </div>
+        {turn.flag && <div className="wf-turn-note">{turn.flag}</div>}
+      </div>
+      {subs.length > 0 && (
+        <div className="wf-branch-list" role="list" aria-label={`${subs.length} helper${subs.length === 1 ? '' : 's'}`}>
+          {subs.map((sub, index) => (
+            <Branch
+              key={sub.agent_id || index}
+              sub={sub}
+              branchKey={`${turnKey}:${sub.agent_id || index}`}
+              store={store}
+              storage={storage}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+export function Timeline({ turns, store, storage }) {
+  const list = Array.isArray(turns) ? turns : []
+  const stableStore = store && store.prompts ? store : { prompts: new Set() }
+  return (
+    <div className="wf-timeline">
+      {list.map((turn, index) => (
+        <Turn
+          key={`${turn.ts || 'turn'}:${index}`}
+          turn={turn}
+          turnKey={String(index)}
+          store={stableStore}
+          storage={storage}
         />
       ))}
     </div>

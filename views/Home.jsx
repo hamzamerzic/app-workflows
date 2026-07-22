@@ -1,36 +1,32 @@
 // Home — the outcome JOURNAL. Reads like a diary of what the assistant got
 // done: an app header, a "Needs you" strip for anything worth a look, then the
-// entries grouped by day. Each entry is one tappable card — an ambient status
-// dot, the plain outcome, an area pill + result + task count — that opens the
-// chat drill-in. No provider vocabulary and no git-graph here; the machine
-// detail lives two levels down. Missing fields are omitted, never faked.
+// entries grouped by day. Each entry is one tappable row — root task, ambient
+// status, latest outcome, and helper count — that opens the layered timeline.
+// Missing fields are omitted, never faked.
 
-import React from 'react'
+import React, { useState } from 'react'
 import { statusDot, groupEntriesByDay } from '../domain.js'
 
 // The strip at the top of the journal. Amber and tappable while something is
-// unverified/failed/running; a quiet "all caught up" once nothing needs a look.
-// Tapping opens the first flagged chat (the count says there are more).
-function NeedsStrip({ items, onOpen }) {
+// unverified/failed/running and absent when everything is healthy. Tapping
+// filters the journal rather than unexpectedly opening only the first item.
+function NeedsStrip({ items, active, onToggle }) {
   const list = Array.isArray(items) ? items : []
-  if (list.length === 0) {
-    return (
-      <div className="wf-needs is-clear">
-        <span className="wf-needs-ic" aria-hidden="true">✓</span>
-        <span className="wf-needs-tx"><span className="wf-needs-head">All caught up</span></span>
-      </div>
-    )
-  }
+  if (list.length === 0) return null
   const first = list[0]
   const n = list.length
   return (
-    <button type="button" className="wf-needs" onClick={() => onOpen(first)}>
+    <button type="button" className="wf-needs" onClick={onToggle} aria-pressed={active}>
       <span className="wf-needs-ic" aria-hidden="true">!</span>
       <span className="wf-needs-tx">
-        <span className="wf-needs-head">{n} thing{n === 1 ? '' : 's'} worth a look</span>
-        {first && first.outcome && <span className="wf-needs-sub">{first.outcome}</span>}
+        <span className="wf-needs-head">
+          {active ? `Showing ${n} item${n === 1 ? '' : 's'} that need a look` : `${n} thing${n === 1 ? '' : 's'} worth a look`}
+        </span>
+        <span className="wf-needs-sub">
+          {active ? 'Show all workflows' : (first && first.outcome) || 'Filter to unfinished work'}
+        </span>
       </span>
-      <span className="wf-needs-go" aria-hidden="true">›</span>
+      <span className="wf-needs-go" aria-hidden="true">{active ? '×' : '›'}</span>
     </button>
   )
 }
@@ -39,8 +35,8 @@ function EntryCard({ entry, onOpen }) {
   const dot = statusDot(entry.status)
   const tasks = Number.isFinite(entry.tasks) ? entry.tasks : null
   const reco = entry.recovered === true
-  const headline = entry.outcome || entry.title || 'Untitled activity'
-  const context = entry.title && entry.title.trim() !== headline.trim() ? entry.title : ''
+  const headline = entry.title || entry.outcome || 'Untitled activity'
+  const context = entry.outcome && entry.outcome.trim() !== headline.trim() ? entry.outcome : ''
   return (
     <button type="button" className={`wf-entry${reco ? ' is-reco' : ''}`} onClick={() => onOpen(entry)}>
       <span className="wf-entry-title">
@@ -49,12 +45,10 @@ function EntryCard({ entry, onOpen }) {
       </span>
       {context && <span className="wf-entry-context">{context}</span>}
       <span className="wf-entry-meta">
-        {entry.area && <span className="wf-pill is-area">{entry.area}</span>}
-        {entry.result && <span className="wf-sep" aria-hidden="true" />}
         {entry.result && <span className="wf-result">{entry.result}</span>}
         {reco && <span className="wf-pill is-reco">✦ recovered</span>}
         {tasks != null && (
-          <span className="wf-tasks">{tasks} task{tasks === 1 ? '' : 's'} ›</span>
+          <span className="wf-tasks">{tasks} helper{tasks === 1 ? '' : 's'} ›</span>
         )}
       </span>
     </button>
@@ -66,7 +60,13 @@ export function Home({
 }) {
   const entries = (idx && Array.isArray(idx.entries)) ? idx.entries : []
   const needs = (idx && Array.isArray(idx.needs_attention)) ? idx.needs_attention : []
-  const groups = groupEntriesByDay(entries)
+  const [attentionOnly, setAttentionOnly] = useState(false)
+  const showAttention = attentionOnly && needs.length > 0
+  const attentionIds = new Set(needs.map((item) => item.chat_id))
+  const visibleEntries = showAttention
+    ? entries.filter((entry) => attentionIds.has(entry.chat_id))
+    : entries
+  const groups = groupEntriesByDay(visibleEntries)
   const isEmpty = loaded && entries.length === 0
 
   return (
@@ -129,7 +129,11 @@ export function Home({
           </div>
         ) : (
           <div className="wf-content">
-            <NeedsStrip items={needs} onOpen={onOpenDetail} />
+            <NeedsStrip
+              items={needs}
+              active={showAttention}
+              onToggle={() => setAttentionOnly((value) => !value)}
+            />
             {groups.map((group) => {
               const groupReco = group.items.some((e) => e && e.recovered === true)
               return (

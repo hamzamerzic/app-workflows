@@ -16,12 +16,6 @@ export function providerLabel(provider) {
   return (typeof provider === 'string' && provider ? provider : 'Agent')
 }
 
-export function providerClass(provider) {
-  if (provider === 'claude') return 'is-claude'
-  if (provider === 'codex') return 'is-codex'
-  return 'is-other'
-}
-
 // ---------------------------------------------------------------------------
 // Ambient status — the three journal/turn states and their dot styling.
 // `done` is the quiet default; `attention` is the amber "needs a look"; `run`
@@ -42,10 +36,10 @@ export function statusDot(status) {
 // ---------------------------------------------------------------------------
 
 const AVATARS = {
-  explore: { cls: 'explore', emoji: '🔍', name: 'Explorer', role: 'read-only helper' },
-  codex: { cls: 'codex', emoji: '◆', name: 'Codex', role: 'second-opinion helper' },
-  build: { cls: 'build', emoji: '🛠', name: 'Builder', role: 'general helper' },
-  general: { cls: 'build', emoji: '🛠', name: 'Helper', role: 'general helper' },
+  explore: { cls: 'explore', emoji: '🔍', name: 'Explorer' },
+  codex: { cls: 'codex', emoji: '◆', name: 'Codex' },
+  build: { cls: 'build', emoji: '🛠', name: 'Builder' },
+  general: { cls: 'build', emoji: '🛠', name: 'Helper' },
 }
 
 export function avatarFor(kind) {
@@ -61,12 +55,6 @@ export function subStateMeta(state) {
   if (state === 'failed') return { cls: 'failed', glyph: '✕', label: 'failed' }
   if (state === 'stopped') return { cls: 'stopped', glyph: '‖', label: 'stopped' }
   return { cls: 'unknown', glyph: '?', label: 'status unavailable' }
-}
-
-// Icon for a `did[]` verb on the subagent detail step list.
-const VERB_ICON = { read: '📖', edited: '✏️', ran: '⌘', wrote: '📝', searched: '🔎' }
-export function verbIcon(verb) {
-  return VERB_ICON[verb] || '•'
 }
 
 // ---------------------------------------------------------------------------
