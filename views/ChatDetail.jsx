@@ -96,8 +96,6 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
   const loaded = detail !== undefined
   const isEmpty = loaded && turns.length === 0 && timelineAgents.length === 0 && timelineEvents.length === 0
   const when = fmtShortDate((detail && detail.ts) || (chatMeta && chatMeta.ts))
-  const taskCount = timelineAgents.length || turns.reduce(
-    (sum, turn) => sum + (Array.isArray(turn.subs) ? turn.subs.length : 0), 0)
   const state = subStateMeta(timelineRootState(timeline, turns))
 
   useLayoutEffect(() => {
@@ -159,8 +157,6 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
                   {provider && <span>{providerLabel(provider)}</span>}
                   {provider && when && <span className="wf-sep" aria-hidden="true" />}
                   {when && <span>{when}</span>}
-                  {(provider || when) && taskCount > 0 && <span className="wf-sep" aria-hidden="true" />}
-                  {taskCount > 0 && <span>{taskCount} helper{taskCount === 1 ? '' : 's'}</span>}
                   <span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span>
                 </div>
                 {prompt && (

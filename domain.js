@@ -62,12 +62,15 @@ export function subStateMeta(state) {
 // ---------------------------------------------------------------------------
 
 export const TIMELINE_GEOMETRY = Object.freeze({
-  top: 34,
-  row: 68,
-  laneOrigin: 82,
-  laneGap: 152,
-  cardWidth: 136,
-  bottom: 46,
+  top: 28,
+  row: 72,
+  laneOrigin: 58,
+  laneGap: 110,
+  cardOffset: 15,
+  cardWidth: 108,
+  mainCardWidth: 132,
+  rightPad: 16,
+  bottom: 38,
 })
 
 function isoMs(value) {
@@ -75,6 +78,10 @@ function isoMs(value) {
   const ms = Date.parse(value)
   return Number.isFinite(ms) ? ms : null
 }
+
+const TIMELINE_CLOCK = new Intl.DateTimeFormat(undefined, {
+  hour: '2-digit', minute: '2-digit',
+})
 
 function canonicalAgentState(value) {
   if (value === 'completed' || value === 'complete' || value === 'finished') return 'done'
@@ -290,22 +297,26 @@ export function normalizeTimeline(timeline, turns = []) {
   }
 }
 
-function extraTimeGap(previous, current) {
-  const a = isoMs(previous && previous.at)
-  const b = isoMs(current && current.at)
-  if (a == null || b == null || b <= a) return 0
-  const seconds = (b - a) / 1000
-  if (seconds <= 10) return 0
-  if (seconds <= 60) return 8
-  if (seconds <= 600) return 16
-  return 28
-}
-
 // Deterministic interval coloring: main is lane 0; helpers receive the lowest
 // free positive lane, never move while alive, and release only at an explicit
-// terminal event. Thus width follows peak concurrency rather than total work.
+// terminal event. Vertical spacing communicates causal order, not elapsed
+// time; the minute labels carry time without making long waits consume space.
+// Width follows peak concurrency rather than total work.
 export function layoutTimeline(timeline, turns = []) {
   const normalized = normalizeTimeline(timeline, turns)
+  // A launch followed seconds later by a provider "started" acknowledgement
+  // is useful evidence, but showing both as separate timeline steps adds noise.
+  // Keep start-only histories visible while folding the common spawn→start pair
+  // into one launch step; the exact started_at remains available in details.
+  const launched = new Set()
+  const displayEvents = []
+  for (const event of normalized.events) {
+    if (event.type === 'agent_spawned' && event.subject_agent_id) {
+      launched.add(event.subject_agent_id)
+    }
+    if (event.type === 'agent_started' && launched.has(event.subject_agent_id)) continue
+    displayEvents.push(event)
+  }
   const agentsById = new Map(normalized.agents.map((agent) => [agent.agent_id, agent]))
   const laneByAgent = new Map([[normalized.mainAgentId, 0]])
   const activeByLane = new Map()
@@ -313,12 +324,12 @@ export function layoutTimeline(timeline, turns = []) {
   let y = TIMELINE_GEOMETRY.top
   let maxLane = 0
 
-  for (const [index, event] of normalized.events.entries()) {
-    if (index) y += TIMELINE_GEOMETRY.row + extraTimeGap(normalized.events[index - 1], event)
+  for (const [index, event] of displayEvents.entries()) {
+    if (index) y += TIMELINE_GEOMETRY.row
     // V3 has no terminal timestamps. Once its observed timestamp group has
     // passed, recycle slots for helpers whose stored status is already final;
     // their visual span remains short and ragged, never a fabricated finish.
-    if (index && normalized.events[index - 1].at !== event.at) {
+    if (index && displayEvents[index - 1].at !== event.at) {
       for (const [lane, activeId] of activeByLane.entries()) {
         const active = agentsById.get(activeId)
         if (active && active.legacy && active.state !== 'running') activeByLane.delete(lane)
@@ -380,17 +391,19 @@ export function layoutTimeline(timeline, turns = []) {
   const spansByAgent = new Map(spans.map((span) => [span.agent.agent_id, span]))
 
   const height = Math.max(150, lastY + TIMELINE_GEOMETRY.bottom + 36)
-  const width = TIMELINE_GEOMETRY.laneOrigin
-    + (maxLane + 1) * TIMELINE_GEOMETRY.laneGap + TIMELINE_GEOMETRY.cardWidth
+  const helperExtent = TIMELINE_GEOMETRY.laneOrigin
+    + maxLane * TIMELINE_GEOMETRY.laneGap
+    + TIMELINE_GEOMETRY.cardOffset + TIMELINE_GEOMETRY.cardWidth
+  const mainExtent = TIMELINE_GEOMETRY.laneOrigin
+    + TIMELINE_GEOMETRY.cardOffset + TIMELINE_GEOMETRY.mainCardWidth
+  const width = Math.max(helperExtent, mainExtent) + TIMELINE_GEOMETRY.rightPad
   return { ...normalized, agentsById, rows, spans, spansByAgent, laneByAgent, maxLane, width, height }
 }
 
 export function formatTimelineTime(value, quality = 'exact') {
   const ms = isoMs(value)
   if (ms == null) return 'Time unavailable'
-  const label = new Intl.DateTimeFormat(undefined, {
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  }).format(new Date(ms))
+  const label = TIMELINE_CLOCK.format(new Date(ms))
   return quality === 'exact' ? label : `~${label}`
 }
 
@@ -399,12 +412,12 @@ export function formatDuration(start, end) {
   const b = isoMs(end)
   if (a == null || b == null || b < a) return ''
   const seconds = Math.round((b - a) / 1000)
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = seconds % 60
-  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  if (seconds < 60) return '<1m'
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
-  return `${hours}h ${minutes % 60}m`
+  const rest = minutes % 60
+  return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
 
 // ---------------------------------------------------------------------------

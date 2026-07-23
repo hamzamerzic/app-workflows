@@ -34,14 +34,12 @@ function xForLane(lane) {
   return TIMELINE_GEOMETRY.laneOrigin + lane * TIMELINE_GEOMETRY.laneGap
 }
 
-function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSelect }) {
+function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSelect, timeLabel, showTime }) {
   const isHelper = row.subject_agent_id !== mainAgentId
   const state = stateMeta(eventState(row, agent))
   const finalState = subStateMeta(agent && agent.state)
-  const time = row.at ? formatTimelineTime(row.at, row.time_quality) : 'Unknown'
   const parent = agent && agent.parent_agent_id
   const unknownParent = isHelper && (!parent || agent.ancestry_quality === 'unknown')
-  const depth = Math.min(3, Math.max(0, Number(agent && agent.depth) || 1) - 1)
   const startAt = span && span.startEvent && span.startEvent.at
   const rawDuration = row.type === 'agent_terminal' ? formatDuration(startAt, row.at) : ''
   const duration = rawDuration && span.startEvent.time_quality === 'exact' && row.time_quality === 'exact'
@@ -53,10 +51,9 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
   if (row.type === 'main_checkpoint' || !isHelper) {
     content = (
       <div className="wf-time-main-card">
-        <span className="wf-time-main-head">
-          <span className="wf-time-main-label">Main agent</span>
-          {row.state && <span className={`wf-time-main-state ${state.cls}`}>{state.glyph} {state.label}</span>}
-        </span>
+        {row.state && state.cls !== 'run' && (
+          <span className={`wf-time-main-state ${state.cls}`}>{state.glyph} {state.label}</span>
+        )}
         <span className="wf-time-main-copy">{row.summary || 'Continued the task'}</span>
         {row.flag && <span className="wf-time-main-flag">{row.flag}</span>}
       </div>
@@ -65,10 +62,10 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
     const av = avatarFor(agent && agent.kind)
     const inner = (
       <>
-        <span className={`wf-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
+        <span className={`wf-junction-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
         <span className="wf-time-launch-copy">
           <span className="wf-time-agent-name">{(agent && agent.name) || av.name}</span>
-          <span className="wf-time-agent-task">{summary}</span>
+          <span className={`wf-time-agent-task${unknownParent || (span && !span.authoritativeEnd) ? ' has-note' : ''}`}>{summary}</span>
           {unknownParent && <span className="wf-time-parent-note">Parent not recorded</span>}
           {!unknownParent && parent && parent !== mainAgentId && (
             <span className="wf-time-parent-note is-parent">Launched by {(parentAgent && parentAgent.name) || 'another helper'}</span>
@@ -84,7 +81,7 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
     content = canSelect ? (
       <button
         type="button"
-        className={`wf-time-launch${selected ? ' is-selected' : ''}`}
+        className={`wf-time-launch ${av.cls}${selected ? ' is-selected' : ''}`}
         onClick={onSelect}
         aria-expanded={selected}
         aria-controls="wf-agent-inspector"
@@ -92,13 +89,15 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
       >
         {inner}
       </button>
-    ) : <div className="wf-time-launch is-static">{inner}</div>
+    ) : <div className={`wf-time-launch ${av.cls} is-static`}>{inner}</div>
   } else if (row.type === 'agent_started') {
     content = <span className="wf-time-small-event">Started</span>
   } else if (row.type === 'agent_terminal') {
     content = (
       <span className={`wf-time-terminal-label ${state.cls}`}>
-        {state.glyph} {state.label}{duration ? ` · ${duration}` : ''}
+        <span aria-hidden="true">{state.glyph}</span>
+        <span className="wf-sr-only">{state.label}{duration ? ', ' : ''}</span>
+        {duration && <span>{duration}</span>}
       </span>
     )
   } else {
@@ -108,9 +107,11 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
   return (
     <li
       className={`wf-time-event is-${row.type}`}
-      style={{ '--wf-y': `${row.y}px`, '--wf-x': `${xForLane(row.lane)}px`, '--wf-indent': `${depth * 12}px` }}
+      style={{ '--wf-y': `${row.y}px`, '--wf-x': `${xForLane(row.lane)}px` }}
     >
-      <time className="wf-time-clock" dateTime={row.at || undefined}>{time}</time>
+      <time className={`wf-time-clock${showTime ? '' : ' is-repeat'}`} dateTime={row.at || undefined}>
+        {showTime ? timeLabel : <span className="wf-sr-only">{timeLabel}</span>}
+      </time>
       <div className="wf-time-event-body">
         {content}
       </div>
@@ -122,6 +123,10 @@ function TimelineDrawing({ model }) {
   const mainX = xForLane(0)
   const firstY = model.rows.length ? model.rows[0].y : 0
   const lastY = model.rows.length ? model.rows[model.rows.length - 1].y : firstY
+  const mainStart = firstY - 18
+  const mainEnd = lastY + 22
+  const mainTravel = Math.max(1, mainEnd - mainStart)
+  const mainPath = `M ${mainX} ${mainStart} C ${mainX + 4} ${mainStart + mainTravel * .3}, ${mainX - 4} ${mainEnd - mainTravel * .3}, ${mainX} ${mainEnd}`
   return (
     <svg
       className="wf-time-drawing"
@@ -131,7 +136,12 @@ function TimelineDrawing({ model }) {
       aria-hidden="true"
       focusable="false"
     >
-      {model.rows.length > 0 && <path className="wf-main-lifeline" d={`M ${mainX} ${firstY - 22} V ${lastY + 24}`} />}
+      {model.rows.length > 0 && (
+        <>
+          <path className="wf-main-lifeline-under" d={mainPath} />
+          <path className="wf-main-lifeline" d={mainPath} />
+        </>
+      )}
       {model.spans.map((span) => {
         const x = xForLane(span.lane)
         const parentId = span.agent.parent_agent_id
@@ -139,20 +149,34 @@ function TimelineDrawing({ model }) {
         const parentX = xForLane(parentLane == null ? 0 : parentLane)
         const unknownParent = !parentId || span.agent.ancestry_quality === 'unknown'
         const ragY = span.endY
+        const direction = x >= parentX ? 1 : -1
+        const bend = Math.min(42, Math.abs(x - parentX) / 2)
+        const lift = 10 + Math.min(8, Math.abs(x - parentX) / 18)
+        const connector = `M ${parentX} ${span.startY} C ${parentX + direction * bend} ${span.startY - 2}, ${x - direction * bend} ${span.startY - lift}, ${x} ${span.startY}`
+        const travel = Math.max(1, span.endY - span.startY)
+        const sway = span.lane % 2 ? 4 : -4
+        const lifeline = travel > 76
+          ? `M ${x} ${span.startY} C ${x + sway} ${span.startY + travel * .32}, ${x - sway} ${span.endY - travel * .32}, ${x} ${span.endY}`
+          : `M ${x} ${span.startY} V ${span.endY}`
+        const terminalClass = span.authoritativeEnd ? subStateMeta(span.terminal.state).cls : ''
         return (
           <g key={span.agent.agent_id}>
-            <path className="wf-connector-under" d={`M ${parentX} ${span.startY} H ${x}`} />
-            <path className={`wf-spawn-connector${unknownParent ? ' is-unknown' : ''}`} d={`M ${parentX} ${span.startY} H ${x}`} />
-            <path className={`wf-agent-lifeline${span.authoritativeEnd ? '' : ' is-open'}`} d={`M ${x} ${span.startY} V ${span.endY}`} />
-            <circle className="wf-agent-start-node" cx={x} cy={span.startY} r="5" />
+            <path className="wf-connector-under" d={connector} />
+            <path className={`wf-spawn-connector${unknownParent ? ' is-unknown' : ''}`} d={connector} />
+            <path className="wf-agent-lifeline-under" d={lifeline} />
+            <path className={`wf-agent-lifeline${span.authoritativeEnd ? '' : ' is-open'}`} d={lifeline} />
+            <circle className="wf-agent-start-ring" cx={x} cy={span.startY} r="16" />
             {span.authoritativeEnd
-              ? <circle className={`wf-agent-end-node ${subStateMeta(span.terminal.state).cls}`} cx={x} cy={span.endY} r="5" />
+              ? <>
+                  <circle className={`wf-agent-end-ring ${terminalClass}`} cx={x} cy={span.endY} r="9" />
+                  <circle className={`wf-agent-end-node ${terminalClass}`} cx={x} cy={span.endY} r="4.5" />
+                </>
               : <path className="wf-agent-ragged" d={`M ${x - 5} ${ragY - 3} l 5 3 l 5 -3 M ${x - 5} ${ragY + 4} l 5 3 l 5 -3`} />}
           </g>
         )
       })}
       {model.rows.filter((row) => row.type === 'main_checkpoint').map((row) => (
-        <circle key={row.event_id} className="wf-main-event-node" cx={mainX} cy={row.y} r="5" />
+        <circle key={row.event_id} className="wf-main-event-node" cx={mainX} cy={row.y} r="7" />
       ))}
     </svg>
   )
@@ -165,10 +189,11 @@ function Inspector({ agent, model, storage, onClose }) {
   const span = model.spansByAgent.get(agent.agent_id)
   const start = span && model.rows.find((row) => row.subject_agent_id === agent.agent_id
     && (row.type === 'agent_spawned' || row.type === 'agent_started'))
-  const started = span && model.rows.find((row) => row.subject_agent_id === agent.agent_id
+  const started = span && model.events.find((row) => row.subject_agent_id === agent.agent_id
     && row.type === 'agent_started')
   const end = span && span.terminal
   const state = subStateMeta(agent.state)
+  const avatar = avatarFor(agent.kind)
   const parent = agent.parent_agent_id === model.mainAgentId
     ? 'Main agent'
     : agent.parent_agent_id
@@ -227,8 +252,9 @@ function Inspector({ agent, model, storage, onClose }) {
       aria-labelledby="wf-inspector-title"
     >
       <header className="wf-inspector-head">
+        <span className={`wf-inspector-avatar ${avatar.cls}`} aria-hidden="true">{avatar.emoji}</span>
         <div>
-          <div className="wf-flow-label">Helper details</div>
+          <div className="wf-flow-label">Assignment</div>
           <h2 id="wf-inspector-title" ref={headingRef} tabIndex={-1}>{agent.name || 'Helper'}</h2>
         </div>
         <button type="button" className="wf-inspector-close" onClick={onClose} aria-label="Close helper details">×</button>
@@ -267,6 +293,19 @@ export function Timeline({ timeline, turns, store, storage }) {
   const selected = selectedId && model.agentsById.get(selectedId)
   const omittedAgents = model.retention.agents_omitted
   const omittedEvents = model.retention.events_omitted
+  const doneCount = model.agents.filter((agent) => agent.state === 'done').length
+  const running = model.agents.filter((agent) => agent.state === 'running').length
+  const needsLook = model.agents.filter((agent) => ['failed', 'stopped', 'unknown'].includes(agent.state)).length
+  const donePercent = model.agents.length ? Math.round((doneCount / model.agents.length) * 100) : 100
+  const displayRows = useMemo(() => {
+    let previousTime = null
+    return model.rows.map((row) => {
+      const timeLabel = row.at ? formatTimelineTime(row.at, row.time_quality) : 'Time unavailable'
+      const showTime = timeLabel === 'Time unavailable' || timeLabel !== previousTime
+      previousTime = timeLabel
+      return { row, timeLabel, showTime }
+    })
+  }, [model.rows])
 
   useEffect(() => {
     if (selectedId && !model.agentsById.has(selectedId)) {
@@ -306,18 +345,45 @@ export function Timeline({ timeline, turns, store, storage }) {
   return (
     <>
       <section ref={timelineRef} className="wf-time-section" aria-label="Chronological agent timeline" tabIndex={-1}>
-        <div className="wf-time-summary">
-          {model.agents.length
-            ? `${model.agents.length} helper${model.agents.length === 1 ? '' : 's'} · up to ${model.maxLane} at once`
-            : 'Main agent only'}
-          {omittedAgents > 0 && ` · ${omittedAgents} earlier helper${omittedAgents === 1 ? '' : 's'} omitted`}
-          {omittedEvents > 0 && ` · ${omittedEvents} lower-level event${omittedEvents === 1 ? '' : 's'} omitted`}
+        <div className="wf-time-overview">
+          <div className="wf-time-overview-copy">
+            <span className="wf-time-overview-title">Helper path</span>
+            <span className="wf-time-overview-count">
+              {model.agents.length ? `${doneCount} of ${model.agents.length} done` : 'Main agent only'}
+            </span>
+          </div>
+          {model.agents.length > 0 && (
+            <div
+              className="wf-time-progress"
+              role="progressbar"
+              aria-label="Helpers done"
+              aria-valuemin="0"
+              aria-valuemax={model.agents.length}
+              aria-valuenow={doneCount}
+            >
+              <span style={{ width: `${donePercent}%` }} />
+            </div>
+          )}
+          {model.agents.length > 0 && (
+            <div className="wf-time-facts" aria-label="Workflow summary">
+              <span>{model.maxLane} at once</span>
+              {running > 0 && <span className="is-running">{running} active</span>}
+              {needsLook > 0 && <span className="is-attention">{needsLook} need{needsLook === 1 ? 's' : ''} a look</span>}
+            </div>
+          )}
+          {(omittedAgents > 0 || omittedEvents > 0) && (
+            <div className="wf-time-retention">
+              {omittedAgents > 0 && `${omittedAgents} earlier helper${omittedAgents === 1 ? '' : 's'} omitted`}
+              {omittedAgents > 0 && omittedEvents > 0 && ' · '}
+              {omittedEvents > 0 && `${omittedEvents} lower-level event${omittedEvents === 1 ? '' : 's'} omitted`}
+            </div>
+          )}
         </div>
-        <div className="wf-time-scroll" tabIndex={model.maxLane > 3 ? 0 : undefined} aria-label={model.maxLane > 3 ? 'Scrollable workflow lanes' : undefined}>
+        <div className="wf-time-scroll" tabIndex={model.maxLane > 0 ? 0 : undefined} aria-label={model.maxLane > 0 ? 'Scrollable workflow lanes' : undefined}>
           <div className="wf-time-canvas" style={{ width: `${model.width}px`, height: `${model.height}px` }}>
             <TimelineDrawing model={model} />
             <ol className="wf-time-events">
-              {model.rows.map((row) => {
+              {displayRows.map(({ row, timeLabel, showTime }) => {
                 const agent = model.agentsById.get(row.subject_agent_id)
                 const parentAgent = agent && agent.parent_agent_id
                   ? model.agentsById.get(agent.parent_agent_id) : null
@@ -332,6 +398,8 @@ export function Timeline({ timeline, turns, store, storage }) {
                     span={span}
                     selected={selectedId === row.subject_agent_id}
                     onSelect={(event) => selectAgent(row.subject_agent_id, event.currentTarget)}
+                    timeLabel={timeLabel}
+                    showTime={showTime}
                   />
                 )
               })}
