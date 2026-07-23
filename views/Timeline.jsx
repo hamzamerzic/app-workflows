@@ -16,7 +16,7 @@ function eventState(event, agent) {
 }
 
 function stateMeta(value) {
-  if (value === 'attention') return { cls: 'stopped', glyph: '!', label: 'needs a look' }
+  if (value === 'attention') return { cls: 'stopped', glyph: '!', label: 'needs input' }
   return subStateMeta(value)
 }
 
@@ -25,7 +25,7 @@ function eventLabel(event, agent, mainAgentId) {
   if (event.subject_agent_id === mainAgentId) return event.summary || 'Main agent activity'
   const name = (agent && agent.name) || 'Helper'
   if (event.type === 'agent_spawned') return `${name} launched: ${(agent && agent.task_summary) || event.summary}`
-  if (event.type === 'agent_started') return `${name} started`
+  if (event.type === 'agent_started') return `${name} started: ${(agent && agent.task_summary) || event.summary}`
   if (event.type === 'agent_terminal') return `${name} ${subStateMeta(event.state).label}`
   return event.summary || `${name} activity`
 }
@@ -34,7 +34,211 @@ function xForLane(lane) {
   return TIMELINE_GEOMETRY.laneOrigin + lane * TIMELINE_GEOMETRY.laneGap
 }
 
-function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSelect, timeLabel, showTime }) {
+function launchCohorts(model) {
+  const byEvent = new Map()
+  const byAgent = new Map()
+  const groups = []
+  let group = []
+  const flush = () => {
+    if (group.length > 1) {
+      const cohort = {
+        id: `cohort:${group[0].event_id}`,
+        firstEventId: group[0].event_id,
+        rows: [...group],
+        agentIds: group.map((row) => row.subject_agent_id),
+      }
+      groups.push(cohort)
+      group.forEach((row, index) => {
+        const member = { ...cohort, position: index + 1, total: group.length }
+        byEvent.set(row.event_id, member)
+        byAgent.set(row.subject_agent_id, member)
+      })
+    }
+    group = []
+  }
+  for (const row of model.rows) {
+    const span = model.spansByAgent.get(row.subject_agent_id)
+    // Cohorts represent one batch launch, not merely tasks that happened to
+    // start close together. A checkpoint/terminal event closes the batch, and
+    // retries for an existing logical helper stay inside that helper's detail.
+    const isLaunch = span && span.startEvent === row
+    if (!isLaunch) {
+      flush()
+      continue
+    }
+    const at = Date.parse(row.at || '')
+    const previous = group[group.length - 1]
+    const firstAt = group.length ? Date.parse(group[0].at || '') : NaN
+    // Only assert a shared launch when the recorder gave us the launcher id,
+    // and keep the whole cohort inside one 20-second window. Comparing with
+    // only the previous launch could otherwise chain a long sequence together.
+    const sameLauncher = previous && previous.actor_agent_id
+      && previous.actor_agent_id === row.actor_agent_id
+    if (previous && (!Number.isFinite(at) || !Number.isFinite(firstAt)
+        || !sameLauncher || at - firstAt > 20_000)) {
+      flush()
+    }
+    group.push(row)
+  }
+  flush()
+  return { byEvent, byAgent, groups }
+}
+
+function isGenericAgentName(name) {
+  return ['helper', 'explorer', 'codex', 'builder'].includes(String(name || '').trim().toLowerCase())
+}
+
+function stateCounts(agents) {
+  const counts = { done: 0, running: 0, failed: 0, stopped: 0, unknown: 0 }
+  for (const agent of agents) {
+    const state = counts[agent.state] == null ? 'unknown' : agent.state
+    counts[state] += 1
+  }
+  return counts
+}
+
+function compactStateSummary(counts) {
+  return [
+    counts.done && `${counts.done} done`,
+    counts.running && `${counts.running} active`,
+    counts.failed && `${counts.failed} failed`,
+    counts.stopped && `${counts.stopped} stopped`,
+    counts.unknown && `${counts.unknown} unknown`,
+  ].filter(Boolean).join(' · ')
+}
+
+function attentionIssue(timeline, turns, agents) {
+  const runs = timeline && Array.isArray(timeline.main_runs) ? timeline.main_runs : []
+  const latestRun = [...runs].sort((a, b) => {
+    const at = Date.parse(a && a.started_at || '')
+    const bt = Date.parse(b && b.started_at || '')
+    if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt
+    return String(a && a.id || '').localeCompare(String(b && b.id || ''))
+  }).at(-1)
+  const runStatus = String(latestRun && latestRun.status || '').toLowerCase()
+  let result = ''
+  let reason = ''
+  if (['running', 'resume_pending'].includes(runStatus)) {
+    return null
+  } else if (runStatus === 'failed') {
+    result = "couldn't complete"
+    reason = 'The main agent could not complete this workflow.'
+  } else if (['stopped', 'interrupted', 'cancelled', 'canceled'].includes(runStatus)) {
+    result = 'stopped'
+    reason = 'The main work stopped before a completion was recorded.'
+  } else if (['parked', 'parked_notified'].includes(runStatus)) {
+    result = 'paused'
+    reason = 'The workflow is paused and may be waiting for your input.'
+  } else {
+    const turn = (Array.isArray(turns) ? turns : []).at(-1)
+    if (!turn || turn.status !== 'attention') return null
+    result = turn.result || 'attention'
+    reason = turn.flag || 'This workflow has an unresolved result.'
+  }
+  const kind = {
+    "couldn't complete": 'failed',
+    stopped: 'stopped',
+    paused: 'paused',
+    'not confirmed': 'unconfirmed',
+  }[result] || 'attention'
+  const targetStates = kind === 'failed'
+    ? ['failed']
+    : kind === 'stopped' ? ['stopped', 'unknown'] : []
+  const rootAttention = [
+    'failed', 'stopped', 'interrupted', 'cancelled', 'canceled',
+    'parked', 'parked_notified',
+  ].includes(runStatus)
+  const latestRunId = String(latestRun && latestRun.id || '')
+  const targetAgents = rootAttention
+    ? agents.filter((candidate) => (
+      latestRunId && String(candidate.chat_run_id || '') === latestRunId
+    ))
+    : agents
+  const agent = targetAgents.filter((candidate) => targetStates.includes(candidate.state))
+    .sort((a, b) => {
+      const at = Date.parse(a.last_activity_at || '')
+      const bt = Date.parse(b.last_activity_at || '')
+      if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt
+      if (Number.isFinite(at) !== Number.isFinite(bt)) return Number.isFinite(at) ? 1 : -1
+      return String(a.agent_id || '').localeCompare(String(b.agent_id || ''))
+    }).at(-1)
+  return { kind, reason, agent }
+}
+
+function AttentionPanel({ issue, onReview, onOpenChat }) {
+  if (!issue) return null
+  const label = {
+    failed: 'Failed',
+    stopped: 'Stopped',
+    paused: 'Paused',
+    unconfirmed: 'Unconfirmed',
+  }[issue.kind] || 'Needs review'
+  const primaryLabel = {
+    failed: 'Retry in chat',
+    stopped: 'Continue in chat',
+    paused: 'Resume in chat',
+    unconfirmed: 'Recheck in chat',
+  }[issue.kind] || 'Open chat'
+  return (
+    <section className="wf-flow-attention" aria-labelledby="wf-flow-attention-title">
+      <span className="wf-flow-attention-icon" aria-hidden="true">!</span>
+      <div className="wf-flow-attention-copy">
+        <div className="wf-flow-attention-head">
+          <h2 id="wf-flow-attention-title">Needs review</h2>
+          <span className={`wf-flow-attention-kind is-${issue.kind}`}>{label}</span>
+        </div>
+        <p className="wf-flow-attention-reason">{issue.reason}</p>
+      </div>
+      <div className="wf-flow-attention-actions">
+        <button type="button" className="wf-btn wf-btn-primary" onClick={onOpenChat}>
+          {primaryLabel}
+        </button>
+        {issue.agent && (
+          <button type="button" className="wf-btn wf-attention-review" onClick={onReview}>
+            Inspect trace
+          </button>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function CohortCard({ row, cohort, model, timeLabel, showTime, onExpand }) {
+  const agents = cohort.agentIds
+    .map((agentId) => model.agentsById.get(agentId))
+    .filter(Boolean)
+  const counts = stateCounts(agents)
+  const summary = compactStateSummary(counts)
+  return (
+    <li
+      className="wf-time-event is-agent_started is-cohort"
+      style={{ '--wf-y': `${row.y}px`, '--wf-x': `${xForLane(row.lane)}px` }}
+    >
+      <time className={`wf-time-clock${showTime ? '' : ' is-repeat'}`} dateTime={row.at || undefined}>
+        {showTime ? timeLabel : <span className="wf-sr-only">{timeLabel}</span>}
+      </time>
+      <div className="wf-time-event-body">
+        <button
+          type="button"
+          className="wf-cohort-launch"
+          onClick={onExpand}
+          aria-label={`${agents.length} helpers launched. ${summary}. Show individual task cards.`}
+        >
+          <span className="wf-cohort-junction" aria-hidden="true">
+            <i /><i /><i />
+          </span>
+            <span className="wf-cohort-copy">
+              <strong>{agents.length} helpers launched</strong>
+              <span>{summary || 'Status unavailable'}</span>
+              <span className="wf-cohort-action">Show all tasks</span>
+            </span>
+        </button>
+      </div>
+    </li>
+  )
+}
+
+function EventCard({ row, agent, parentAgent, mainAgentId, span, cohort, selected, onSelect, timeLabel, showTime }) {
   const isHelper = row.subject_agent_id !== mainAgentId
   const state = stateMeta(eventState(row, agent))
   const finalState = subStateMeta(agent && agent.state)
@@ -60,12 +264,19 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, selected, onSel
     )
   } else if (row.type === 'agent_spawned' || (row.type === 'agent_started' && span && span.startEvent === row)) {
     const av = avatarFor(agent && agent.kind)
+    const recordedName = (agent && agent.name) || av.name
+    const helperLabel = cohort
+      ? `${isGenericAgentName(recordedName) ? 'Helper' : recordedName} ${cohort.position}/${cohort.total}`
+      : isGenericAgentName(recordedName) ? '' : recordedName
     const inner = (
       <>
         <span className={`wf-junction-avatar ${av.cls}`} aria-hidden="true">{av.emoji}</span>
         <span className="wf-time-launch-copy">
-          <span className="wf-time-agent-name">{(agent && agent.name) || av.name}</span>
+          {helperLabel && <span className="wf-time-agent-name">{helperLabel}</span>}
           <span className={`wf-time-agent-task${unknownParent || (span && !span.authoritativeEnd) ? ' has-note' : ''}`}>{summary}</span>
+          {agent && agent.attempt_count > 1 && (
+            <span className="wf-time-parent-note is-attempts">{agent.attempt_count} attempts</span>
+          )}
           {unknownParent && <span className="wf-time-parent-note">Parent not recorded</span>}
           {!unknownParent && parent && parent !== mainAgentId && (
             <span className="wf-time-parent-note is-parent">Launched by {(parentAgent && parentAgent.name) || 'another helper'}</span>
@@ -182,7 +393,7 @@ function TimelineDrawing({ model }) {
   )
 }
 
-function Inspector({ agent, model, storage, onClose }) {
+function Inspector({ agent, model, storage, onClose, onOpenChat }) {
   const [prompt, setPrompt] = useState(undefined)
   const headingRef = useRef(null)
   const dialogRef = useRef(null)
@@ -263,15 +474,43 @@ function Inspector({ agent, model, storage, onClose }) {
         <p className="wf-inspector-task">{agent.task_summary}</p>
         <dl className="wf-inspector-facts">
           <div><dt>Status</dt><dd><span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span></dd></div>
+          {agent.attempt_count > 1 && (
+            <div>
+              <dt>Attempts</dt>
+              <dd>
+                {agent.attempt_count} ({Object.entries(agent.attempt_states || {})
+                  .filter(([, count]) => count > 0)
+                  .map(([attemptState, count]) => `${count} ${attemptState}`)
+                  .join(', ')})
+              </dd>
+            </div>
+          )}
           <div><dt>Launched by</dt><dd>{parent}</dd></div>
           {start && <div><dt>{start.type === 'agent_spawned' ? 'Launched' : 'Started'}</dt><dd><time dateTime={start.at || undefined}>{formatTimelineTime(start.at, start.time_quality)}</time></dd></div>}
-          {started && started !== start && <div><dt>Started</dt><dd><time dateTime={started.at || undefined}>{formatTimelineTime(started.at, started.time_quality)}</time></dd></div>}
+          {started && started.event_id !== (start && start.event_id) && (
+            <div><dt>Started</dt><dd><time dateTime={started.at || undefined}>{formatTimelineTime(started.at, started.time_quality)}</time></dd></div>
+          )}
           {end && <div><dt>Finished</dt><dd><time dateTime={end.at || undefined}>{formatTimelineTime(end.at, end.time_quality)}</time></dd></div>}
           {duration && <div><dt>Duration</dt><dd>{duration}</dd></div>}
           {!end && agent.state !== 'running' && <div><dt>Finished</dt><dd>End time not recorded</dd></div>}
           {agent.timing_conflict && <div><dt>Timing</dt><dd>Recorded times conflict</dd></div>}
         </dl>
         {agent.outcome_summary && <section className="wf-inspector-section"><h3>Outcome</h3><p>{agent.outcome_summary}</p></section>}
+        {agent.state !== 'done' && (
+          <section className="wf-inspector-section wf-inspector-action">
+            <h3>What you can do</h3>
+            <p>
+              {agent.state === 'failed'
+                ? 'Review the prompt and outcome above, then retry this work from the original chat.'
+                : agent.state === 'running'
+                  ? 'The helper is still active. Open the original chat if you need to steer or stop it.'
+                  : 'The trace has no confirmed completion. Check the original chat, then continue the work if it is still needed.'}
+            </p>
+            <button type="button" className="wf-btn wf-btn-primary" onClick={onOpenChat}>
+              Open original chat ↗
+            </button>
+          </section>
+        )}
         <section className="wf-inspector-section">
           <h3>Full prompt</h3>
           {prompt === undefined
@@ -285,27 +524,45 @@ function Inspector({ agent, model, storage, onClose }) {
   )
 }
 
-export function Timeline({ timeline, turns, store, storage }) {
+export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
   const model = useMemo(() => layoutTimeline(timeline, turns), [timeline, turns])
   const [selectedId, setSelectedId] = useState(() => store && store.selectedAgentId || null)
+  // Individual assignment bubbles are the primary representation: they answer
+  // "what is each helper doing?" without another click. Dense launch grouping
+  // remains available as an explicit owner choice.
+  const [cohortsExpanded, setCohortsExpanded] = useState(true)
   const triggerRef = useRef(null)
   const timelineRef = useRef(null)
   const selected = selectedId && model.agentsById.get(selectedId)
   const omittedAgents = model.retention.agents_omitted
   const omittedEvents = model.retention.events_omitted
-  const doneCount = model.agents.filter((agent) => agent.state === 'done').length
-  const running = model.agents.filter((agent) => agent.state === 'running').length
-  const needsLook = model.agents.filter((agent) => ['failed', 'stopped', 'unknown'].includes(agent.state)).length
-  const donePercent = model.agents.length ? Math.round((doneCount / model.agents.length) * 100) : 100
+  const counts = useMemo(() => stateCounts(model.agents), [model.agents])
+  const incompleteCount = counts.failed + counts.stopped + counts.unknown
+  const issue = useMemo(
+    () => attentionIssue(timeline, turns, model.agents),
+    [timeline, turns, model.agents],
+  )
+  const cohorts = useMemo(() => launchCohorts(model), [model])
+  const healthSegments = [
+    { key: 'done', label: 'done', count: counts.done },
+    { key: 'running', label: 'active', count: counts.running },
+    { key: 'failed', label: 'failed', count: counts.failed },
+    { key: 'stopped', label: 'stopped', count: counts.stopped },
+    { key: 'unknown', label: 'unknown', count: counts.unknown },
+  ].filter((segment) => segment.count > 0)
   const displayRows = useMemo(() => {
+    const visibleRows = cohortsExpanded ? model.rows : model.rows.filter((row) => {
+      const cohort = cohorts.byAgent.get(row.subject_agent_id)
+      return !cohort || row.event_id === cohort.firstEventId
+    })
     let previousTime = null
-    return model.rows.map((row) => {
+    return visibleRows.map((row) => {
       const timeLabel = row.at ? formatTimelineTime(row.at, row.time_quality) : 'Time unavailable'
       const showTime = timeLabel === 'Time unavailable' || timeLabel !== previousTime
       previousTime = timeLabel
       return { row, timeLabel, showTime }
     })
-  }, [model.rows])
+  }, [model.rows, cohorts, cohortsExpanded])
 
   useEffect(() => {
     if (selectedId && !model.agentsById.has(selectedId)) {
@@ -345,35 +602,61 @@ export function Timeline({ timeline, turns, store, storage }) {
   return (
     <>
       <section ref={timelineRef} className="wf-time-section" aria-label="Chronological agent timeline" tabIndex={-1}>
+        <AttentionPanel
+          issue={issue}
+          onReview={(event) => issue.agent && selectAgent(issue.agent.agent_id, event.currentTarget)}
+          onOpenChat={onOpenChat}
+        />
         <div className="wf-time-overview">
           <div className="wf-time-overview-copy">
-            <span className="wf-time-overview-title">Helper path</span>
+            <span className="wf-time-overview-title">
+              {model.agents.length
+                ? `${model.agents.length} helper${model.agents.length === 1 ? '' : 's'}`
+                : 'Main agent only'}
+            </span>
             <span className="wf-time-overview-count">
-              {model.agents.length ? `${doneCount} of ${model.agents.length} done` : 'Main agent only'}
+              {counts.done} done
+              {counts.running ? ` · ${counts.running} active` : ''}
+              {incompleteCount ? ` · ${incompleteCount} incomplete` : ''}
             </span>
           </div>
           {model.agents.length > 0 && (
             <div
-              className="wf-time-progress"
-              role="progressbar"
-              aria-label="Helpers done"
-              aria-valuemin="0"
-              aria-valuemax={model.agents.length}
-              aria-valuenow={doneCount}
+              className="wf-time-health"
+              role="img"
+              aria-label={healthSegments.map((segment) => `${segment.count} ${segment.label}`).join(', ')}
             >
-              <span style={{ width: `${donePercent}%` }} />
+              {healthSegments.map((segment) => (
+                <span
+                  className={`is-${segment.key}`}
+                  key={segment.key}
+                  style={{ flexGrow: segment.count, flexBasis: 0 }}
+                />
+              ))}
             </div>
           )}
           {model.agents.length > 0 && (
             <div className="wf-time-facts" aria-label="Workflow summary">
+              {healthSegments.map((segment) => (
+                <span className={`is-${segment.key}`} key={segment.key}>
+                  <i aria-hidden="true" />{segment.count} {segment.label}
+                </span>
+              ))}
               <span>{model.maxLane} at once</span>
-              {running > 0 && <span className="is-running">{running} active</span>}
-              {needsLook > 0 && <span className="is-attention">{needsLook} need{needsLook === 1 ? 's' : ''} a look</span>}
+              {cohorts.groups.length > 0 && (
+                <button
+                  type="button"
+                  className="wf-cohort-toggle"
+                  onClick={() => setCohortsExpanded((value) => !value)}
+                >
+                  {cohortsExpanded ? 'Group launches' : 'Show every task'}
+                </button>
+              )}
             </div>
           )}
           {(omittedAgents > 0 || omittedEvents > 0) && (
             <div className="wf-time-retention">
-              {omittedAgents > 0 && `${omittedAgents} earlier helper${omittedAgents === 1 ? '' : 's'} omitted`}
+              {omittedAgents > 0 && `${omittedAgents} lower-detail helper record${omittedAgents === 1 ? '' : 's'} summarized`}
               {omittedAgents > 0 && omittedEvents > 0 && ' · '}
               {omittedEvents > 0 && `${omittedEvents} lower-level event${omittedEvents === 1 ? '' : 's'} omitted`}
             </div>
@@ -384,6 +667,20 @@ export function Timeline({ timeline, turns, store, storage }) {
             <TimelineDrawing model={model} />
             <ol className="wf-time-events">
               {displayRows.map(({ row, timeLabel, showTime }) => {
+                const cohort = cohorts.byEvent.get(row.event_id)
+                if (!cohortsExpanded && cohort) {
+                  return (
+                    <CohortCard
+                      key={cohort.id}
+                      row={row}
+                      cohort={cohort}
+                      model={model}
+                      timeLabel={timeLabel}
+                      showTime={showTime}
+                      onExpand={() => setCohortsExpanded(true)}
+                    />
+                  )
+                }
                 const agent = model.agentsById.get(row.subject_agent_id)
                 const parentAgent = agent && agent.parent_agent_id
                   ? model.agentsById.get(agent.parent_agent_id) : null
@@ -396,6 +693,7 @@ export function Timeline({ timeline, turns, store, storage }) {
                     parentAgent={parentAgent}
                     mainAgentId={model.mainAgentId}
                     span={span}
+                    cohort={cohorts.byEvent.get(row.event_id)}
                     selected={selectedId === row.subject_agent_id}
                     onSelect={(event) => selectAgent(row.subject_agent_id, event.currentTarget)}
                     timeLabel={timeLabel}
@@ -410,7 +708,13 @@ export function Timeline({ timeline, turns, store, storage }) {
       {selected && (
         <>
           <button type="button" className="wf-inspector-backdrop" onClick={closeInspector} tabIndex={-1} aria-hidden="true" />
-          <Inspector agent={selected} model={model} storage={storage} onClose={closeInspector} />
+          <Inspector
+            agent={selected}
+            model={model}
+            storage={storage}
+            onClose={closeInspector}
+            onOpenChat={onOpenChat}
+          />
         </>
       )}
     </>
