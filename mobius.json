@@ -1,7 +1,7 @@
 {
   "id": "workflows",
   "name": "Workflows",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "An outcome journal for background work: skim completed outcomes, items that need attention, and each helper's assignment.",
   "author": "mobius-os",
   "license": "MIT",
@@ -21,7 +21,8 @@
   "runtime": {
     "imports": [
       "react",
-      "react-dom"
+      "react-dom",
+      "lucide-react"
     ],
     "esm_deps": []
   },

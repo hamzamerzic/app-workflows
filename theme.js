@@ -103,11 +103,6 @@ export const CSS = `
 .wf-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 /* /mobius-ui:Header */
 
-.wf-status-text {
-  font-size: 11.5px; color: var(--muted); white-space: nowrap;
-  max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
-}
-
 /* A text back-link — "‹ Activity" / "‹ Back". */
 .wf-back-text {
   flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px;
@@ -129,20 +124,12 @@ export const CSS = `
 .wf-btn:active { transform: scale(0.97); }
 .wf-btn:disabled { opacity: 0.5; cursor: default; }
 .wf-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.wf-btn-secondary { background: var(--surface2, var(--surface)); }
+.wf-btn-secondary:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.wf-btn-icon { width: 44px; padding: 0; border-radius: 8px; }
+.wf-btn-icon svg { width: 18px; height: 18px; }
+.wf-btn-icon.is-spinning svg { animation: wf-spin 0.9s linear infinite; }
 /* /mobius-ui:Button */
-
-.wf-icon-btn {
-  flex: 0 0 auto; width: 44px; height: 44px; display: inline-flex;
-  align-items: center; justify-content: center; border-radius: 10px;
-  border: 0; background: none; color: var(--muted);
-  font-size: 18px; line-height: 1; cursor: pointer;
-  transition: color .14s ease, transform .1s ease;
-}
-.wf-icon-btn:hover { color: var(--text); }
-.wf-icon-btn:active { transform: scale(0.94); }
-.wf-icon-btn:disabled { opacity: 0.55; cursor: default; }
-.wf-icon-btn .wf-refresh-glyph { display: inline-block; }
-.wf-icon-btn.is-spinning .wf-refresh-glyph { animation: wf-spin 0.9s linear infinite; }
 
 /* ===== Journal (Home) ====================================================== */
 
