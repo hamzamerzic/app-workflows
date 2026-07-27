@@ -5,7 +5,7 @@
 // Missing fields are omitted, never faked.
 
 import React, { useState } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { ArrowRotateCw } from '@openai/apps-sdk-ui/components/Icon'
 import { statusDot, groupEntriesByDay } from '../domain.js'
 
 const TRIAGE_META = {
@@ -238,7 +238,7 @@ export function Home({
             title={refreshing ? 'Checking for new activity' : `Check for new activity · ${updatedLabel}`}
             aria-label="Check for new workflow activity"
           >
-            <RefreshCw aria-hidden="true" />
+            <ArrowRotateCw aria-hidden="true" />
           </button>
         </div>
       </header>
