@@ -5,6 +5,7 @@
 // Missing fields are omitted, never faked.
 
 import React, { useState } from 'react'
+import { RefreshCw } from 'lucide-react'
 import { statusDot, groupEntriesByDay } from '../domain.js'
 
 const TRIAGE_META = {
@@ -228,16 +229,16 @@ export function Home({
           </div>
         </div>
         <div className="wf-header-actions">
-          {refreshing && <span className="wf-status-text" role="status">Updating…</span>}
+          {refreshing && <span className="wf-sr-only" role="status">Checking for new workflow activity</span>}
           <button
             type="button"
-            className={`wf-icon-btn${refreshing ? ' is-spinning' : ''}`}
+            className={`wf-btn wf-btn-secondary wf-btn-icon${refreshing ? ' is-spinning' : ''}`}
             onClick={onRefresh}
             disabled={refreshing}
-            title={updatedLabel}
-            aria-label="Refresh"
+            title={refreshing ? 'Checking for new activity' : `Check for new activity · ${updatedLabel}`}
+            aria-label="Check for new workflow activity"
           >
-            <span className="wf-refresh-glyph" aria-hidden="true">⟳</span>
+            <RefreshCw aria-hidden="true" />
           </button>
         </div>
       </header>
