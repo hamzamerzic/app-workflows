@@ -3,6 +3,14 @@
 // the ordered event list remains the accessible source of truth.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  CheckCircleFilled,
+  CircleDashed,
+  PauseCircle,
+  Warning,
+  X,
+  XCircle,
+} from '@openai/apps-sdk-ui/components/Icon'
 import { Markdown } from './Markdown.jsx'
 import {
   TIMELINE_GEOMETRY, avatarFor, formatDuration, formatTimelineTime,
@@ -18,6 +26,21 @@ function eventState(event, agent) {
 function stateMeta(value) {
   if (value === 'attention') return { cls: 'stopped', glyph: '!', label: 'needs input' }
   return subStateMeta(value)
+}
+
+const STATE_ICONS = {
+  done: CheckCircleFilled,
+  run: CircleDashed,
+  failed: XCircle,
+  stopped: PauseCircle,
+  unknown: Warning,
+}
+
+export function WorkflowStateIcon({ state }) {
+  const StateIcon = state.label === 'needs input'
+    ? Warning
+    : (STATE_ICONS[state.cls] || Warning)
+  return <StateIcon className="wf-state-icon" aria-hidden="true" />
 }
 
 function eventLabel(event, agent, mainAgentId) {
@@ -256,7 +279,10 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, cohort, selecte
     content = (
       <div className="wf-time-main-card">
         {row.state && state.cls !== 'run' && (
-          <span className={`wf-time-main-state ${state.cls}`}>{state.glyph} {state.label}</span>
+          <span className={`wf-time-main-state ${state.cls}`}>
+            <WorkflowStateIcon state={state} />
+            {state.label}
+          </span>
         )}
         <span className="wf-time-main-copy">{row.summary || 'Continued the task'}</span>
         {row.flag && <span className="wf-time-main-flag">{row.flag}</span>}
@@ -283,7 +309,8 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, cohort, selecte
           )}
           {span && !span.authoritativeEnd && (
             <span className="wf-time-end-note">
-              {finalState.glyph} {finalState.label} · {agent && agent.state === 'running' ? 'no end yet' : 'end not recorded'}
+              <WorkflowStateIcon state={finalState} />
+              {finalState.label} · {agent && agent.state === 'running' ? 'no end yet' : 'end not recorded'}
             </span>
           )}
         </span>
@@ -306,7 +333,7 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, cohort, selecte
   } else if (row.type === 'agent_terminal') {
     content = (
       <span className={`wf-time-terminal-label ${state.cls}`}>
-        <span aria-hidden="true">{state.glyph}</span>
+        <WorkflowStateIcon state={state} />
         <span className="wf-sr-only">{state.label}{duration ? ', ' : ''}</span>
         {duration && <span>{duration}</span>}
       </span>
@@ -468,12 +495,14 @@ function Inspector({ agent, model, storage, onClose, onOpenChat }) {
           <div className="wf-flow-label">Assignment</div>
           <h2 id="wf-inspector-title" ref={headingRef} tabIndex={-1}>{agent.name || 'Helper'}</h2>
         </div>
-        <button type="button" className="wf-inspector-close" onClick={onClose} aria-label="Close helper details">×</button>
+        <button type="button" className="wf-inspector-close" onClick={onClose} aria-label="Close helper details">
+          <X width="1em" height="1em" aria-hidden="true" />
+        </button>
       </header>
       <div className="wf-inspector-scroll">
         <p className="wf-inspector-task">{agent.task_summary}</p>
         <dl className="wf-inspector-facts">
-          <div><dt>Status</dt><dd><span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span></dd></div>
+          <div><dt>Status</dt><dd><span className={`wf-sub-state ${state.cls}`}><WorkflowStateIcon state={state} /> {state.label}</span></dd></div>
           {agent.attempt_count > 1 && (
             <div>
               <dt>Attempts</dt>

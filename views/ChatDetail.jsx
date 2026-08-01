@@ -6,9 +6,10 @@
 // execution logs stay out of the primary experience.
 
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo } from 'react'
+import { ArrowLeft, ArrowUpRight, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { providerLabel, subStateMeta } from '../domain.js'
 import { Markdown } from './Markdown.jsx'
-import { Timeline } from './Timeline.jsx'
+import { Timeline, WorkflowStateIcon } from './Timeline.jsx'
 
 function fmtShortDate(ts) {
   if (ts == null) return ''
@@ -127,10 +128,14 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
   return (
     <div className="wf-root">
       <header className="wf-header">
-        <button type="button" className="wf-back-text" onClick={onBack}>‹ Activity</button>
+        <button type="button" className="wf-back-text" onClick={onBack}>
+          <ArrowLeft width="1em" height="1em" aria-hidden="true" />
+          Activity
+        </button>
         <span className="wf-spacer" />
         <button type="button" className="wf-openchat" onClick={() => onOpenChat(chatId)}>
-          Open chat ↗
+          Open chat
+          <ArrowUpRight width="1em" height="1em" aria-hidden="true" />
         </button>
       </header>
 
@@ -157,12 +162,12 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
                   {provider && <span>{providerLabel(provider)}</span>}
                   {provider && when && <span className="wf-sep" aria-hidden="true" />}
                   {when && <span>{when}</span>}
-                  <span className={`wf-sub-state ${state.cls}`}>{state.glyph} {state.label}</span>
+                  <span className={`wf-sub-state ${state.cls}`}><WorkflowStateIcon state={state} /> {state.label}</span>
                 </div>
                 {prompt && (
                   <details className="wf-prompt" open={rootPromptOpen} onToggle={onRootToggle}>
                     <summary className="wf-prompt-sum">
-                      <span className="wf-cx" aria-hidden="true">›</span> Full prompt
+                      <ChevronRight className="wf-cx" aria-hidden="true" /> Full prompt
                     </summary>
                     {rootPromptOpen && <div className="wf-prompt-body"><Markdown text={prompt} /></div>}
                   </details>
