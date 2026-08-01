@@ -5,7 +5,13 @@
 // Missing fields are omitted, never faked.
 
 import React, { useState } from 'react'
-import { ArrowRotateCw } from '@openai/apps-sdk-ui/components/Icon'
+import {
+  ArrowRotateCw,
+  CheckCircleFilled,
+  ChevronRight,
+  CircleDashed,
+  Warning,
+} from '@openai/apps-sdk-ui/components/Icon'
 import { statusDot, groupEntriesByDay } from '../domain.js'
 
 const TRIAGE_META = {
@@ -155,7 +161,9 @@ function NeedsPanel({ items, open, onToggle, onOpen, onContinue }) {
 
 function EntryCard({ entry, onOpen }) {
   const dot = statusDot(entry.status)
-  const glyph = dot === 'done' ? '✓' : dot === 'attn' ? '!' : dot === 'run' ? '◌' : '•'
+  const StateIcon = dot === 'done'
+    ? CheckCircleFilled
+    : dot === 'run' ? CircleDashed : Warning
   const stateLabel = dot === 'done'
     ? 'Done'
     : dot === 'attn'
@@ -169,7 +177,7 @@ function EntryCard({ entry, onOpen }) {
   const context = entry.outcome && entry.outcome.trim() !== headline.trim() ? entry.outcome : ''
   return (
     <button type="button" className={`wf-entry${reco ? ' is-reco' : ''}`} onClick={() => onOpen(entry)}>
-      <span className={`wf-entry-node ${dot}`} aria-hidden="true">{glyph}</span>
+      <span className={`wf-entry-node ${dot}`} aria-hidden="true"><StateIcon /></span>
       <span className="wf-entry-copy">
         <span className="wf-sr-only">{stateLabel}. </span>
         <span className="wf-entry-title">{headline}</span>
@@ -182,7 +190,7 @@ function EntryCard({ entry, onOpen }) {
           )}
         </span>
       </span>
-      <span className="wf-entry-go" aria-hidden="true">›</span>
+      <ChevronRight className="wf-entry-go" aria-hidden="true" />
     </button>
   )
 }

@@ -277,7 +277,8 @@ export const CSS = `
   font-size: 10.5px; font-weight: 700; color: var(--muted); white-space: nowrap;
   padding: 2px 7px; border-radius: 999px; background: var(--wf-s3);
 }
-.wf-entry-go { justify-self: center; color: var(--muted); font-size: 22px; line-height: 1; }
+.wf-entry-go { justify-self: center; color: var(--muted); width: 20px; height: 20px; }
+.wf-entry-node svg { width: 1em; height: 1em; display: block; }
 
 /* Pills + separator dot — shared by journal entries and turn meta. */
 .wf-pill {
@@ -290,7 +291,8 @@ export const CSS = `
 /* ===== Layered workflow timeline ========================================== */
 
 .wf-openchat {
-  flex: 0 0 auto; appearance: none; font: inherit; font-weight: 600; font-size: 12.5px;
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  appearance: none; font: inherit; font-weight: 600; font-size: 12.5px;
   min-height: 44px; padding: 7px 10px; border-radius: 9px; cursor: pointer;
   border: 0; background: transparent; color: var(--wf-link);
 }
@@ -331,7 +333,7 @@ export const CSS = `
   list-style: none; cursor: pointer; color: var(--wf-link); font-size: 12px; font-weight: 650;
 }
 .wf-prompt-sum::-webkit-details-marker { display: none; }
-.wf-cx { display: inline-block; transition: transform .16s ease; }
+.wf-cx { display: inline-block; width: 14px; height: 14px; transition: transform .16s ease; }
 .wf-prompt[open] .wf-cx { transform: rotate(90deg); }
 .wf-prompt-body {
   max-width: 70ch; margin-top: 4px; padding: 12px 14px; border-radius: 10px;
@@ -481,6 +483,7 @@ export const CSS = `
   color: var(--muted); font-size: 10.5px; font-weight: 700;
 }
 .wf-time-main-state {
+  display: inline-flex; align-items: center; gap: 3px;
   width: max-content; color: var(--muted); font-size: 9px; font-weight: 700;
 }
 .wf-time-main-state.done { color: color-mix(in srgb, var(--wf-done) 65%, var(--text)); }
@@ -558,7 +561,7 @@ export const CSS = `
 .wf-time-agent-task.has-note { -webkit-line-clamp: 2; }
 .wf-time-parent-note { color: var(--muted); font-size: 10px; line-height: 1.25; }
 .wf-time-parent-note.is-parent { display: none; }
-.wf-time-end-note { color: var(--muted); font-size: 9.5px; line-height: 1.2; }
+.wf-time-end-note { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); font-size: 9.5px; line-height: 1.2; }
 .wf-time-small-event, .wf-time-terminal-label {
   display: inline-flex; width: max-content; max-width: 108px; min-height: 26px;
   align-items: center; gap: 4px; padding: 4px 8px 5px; border-radius: 10px;
@@ -573,6 +576,7 @@ export const CSS = `
   padding: 3px 8px; border-radius: 999px; display: inline-flex; gap: 4px; align-items: center;
   background: var(--wf-s3); color: var(--muted);
 }
+.wf-state-icon { width: 1em; height: 1em; flex: 0 0 auto; }
 .wf-sub-state.done { background: var(--wf-done-soft); color: var(--text); }
 .wf-sub-state.run { background: var(--wf-run-soft); color: var(--text); }
 .wf-sub-state.failed { background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent); color: var(--text); }
@@ -615,6 +619,7 @@ export const CSS = `
   appearance: none; border: 0; border-radius: 9px; background: transparent;
   color: var(--muted); font: inherit; font-size: 22px; cursor: pointer;
 }
+.wf-inspector-close svg { display: block; }
 .wf-inspector-close:hover { background: var(--wf-s2); color: var(--text); }
 .wf-inspector-scroll {
   flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
