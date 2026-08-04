@@ -1,6 +1,6 @@
 // Workflows — a read-only window onto the background helpers your chats spin up.
 // This entry owns only composition: the module tree is declared in mobius.json's
-// source_files, and esbuild bundles from here.
+// source_files, and Rolldown bundles from here.
 //
 //   storage.js        — read-through storage + the run-now refresh transport
 //   domain.js         — pure derive/format/order helpers (the testable core)
