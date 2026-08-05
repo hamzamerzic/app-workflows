@@ -114,6 +114,9 @@ MAX_TIMELINE_EVENTS_PER_CHAT = MAX_TIMELINE_AGENTS * 3 + 40
 SCHEMA_NOTES = """\
 index.json  {schema, updated_at, needs_attention:[{chat_id,title,outcome,kind,reason,next_action,agent_id}], entries:[...], history:{chats_omitted}}
 chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...], timeline:{...,retention}}
+  turn.note: display-only completeness line ("N of M helpers never reported a
+  result…") when a fleet's own journal proves more helpers launched than ever
+  returned. Never a flag: a delivered turn stays out of needs_attention.
 helpers/<id> {schema, agent_id, chat_id, brief_full}
 """
 
@@ -501,6 +504,7 @@ def _run(model: dict, sid: str, run_id: str, kind: str, label: str) -> dict:
   r = model["runs"].setdefault(rkey, {
     "sid": sid, "run_id": run_id, "kind": kind, "label": label,
     "started_at": None, "ended_at": None, "phases": [], "agent_keys": [],
+    "journal_started": 0, "journal_resulted": 0,
   })
   if label:
     r["label"] = label
@@ -757,16 +761,47 @@ def _parse_journal(journal_path: Path, sid: str, run_id: str, kind: str,
                    model: dict, cursors: CursorStore, budget: Budget) -> None:
   """Journal lines are `{type:started|result, agentId, result}`. A `result`
   line is the authoritative "this helper finished" signal and carries the
-  helper's own reported outcome."""
-  _rescanned, records, cur = read_delta(journal_path, cursors.get(str(journal_path)), budget)
+  helper's own reported outcome. `started` lines are counted per run (never
+  folded per agent): the launched-versus-reported gap is the run-level
+  evidence that a fleet ended before every helper returned — e.g. the owning
+  turn was stopped mid-run — independently of which transcripts survived.
+
+  The counters carry two integrity guards so a completeness note can never
+  be a false alarm: `journal_counted_from_start` proves counting began at
+  byte 0 (a cursor that pre-dates the counters leaves it unset — such runs
+  simply never get a note), and `journal_caught_up` proves the last pass
+  reached EOF (a budget-cut or mid-append read suppresses the note until a
+  later refresh finishes the file)."""
+  cursor = cursors.get(str(journal_path))
+  fresh_start = cursor.get("ino") is None
+  rescanned, records, cur = read_delta(journal_path, cursor, budget)
   cursors.set(str(journal_path), cur)
+  if cur.get("ino") is None:
+    return  # journal absent: nothing to count, nothing to reset
+  run = None
+  if rescanned or fresh_start:
+    run = _run(model, sid, run_id, kind, "")
+    run["journal_started"] = 0
+    run["journal_resulted"] = 0
+    run["journal_counted_from_start"] = True
   for rec in records:
-    if rec.get("type") != "result":
-      continue
     agent_id = rec.get("agentId")
     if not agent_id:
       continue
+    if rec.get("type") == "started":
+      run = _run(model, sid, run_id, kind, "")
+      run["journal_started"] = run.get("journal_started", 0) + 1
+      continue
+    if rec.get("type") != "result":
+      continue
+    run = _run(model, sid, run_id, kind, "")
+    run["journal_resulted"] = run.get("journal_resulted", 0) + 1
     _agent(model, sid, run_id, str(agent_id), kind)["result"] = rec.get("result")
+  run = _run(model, sid, run_id, kind, "")
+  try:
+    run["journal_caught_up"] = int(cur.get("offset", 0)) >= journal_path.stat().st_size
+  except OSError:
+    run["journal_caught_up"] = False
 
 
 def _parse_task_board(board_dir: Path, sid: str, model: dict) -> None:
@@ -2882,6 +2917,19 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
   # A delivery claim is only a hero line when the evidence supports `done`.
   # Attention/running turns stay neutral and put the caveat in `flag`.
   outcome = delivery if status == "done" and delivery else neutral
+
+  # A finished fleet whose journal launched more helpers than ever reported
+  # gets an honest, display-only completeness note. Deliberately NOT a flag:
+  # a delivered turn stays out of "Needs you"; the owner just gets to tell a
+  # complete answer from a partial one.
+  note = None
+  silent = raw.get("_silent_helpers")
+  if silent and status != "running":
+    launched = int(raw.get("_launched_helpers") or 0) or len(subs) or int(silent)
+    unit = "helper" if launched == 1 else "helpers"
+    note = (f"{silent} of {launched} {unit} never reported a result, "
+            "so this outcome may reflect partial work.")
+
   public_subs = [{
     "agent_id": sub["agent_id"], "kind": sub["kind"], "name": sub["name"],
     "ask": sub["ask"], "state": sub["state"], "depth": sub["depth"],
@@ -2889,7 +2937,7 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
   } for sub in subs]
   return {
     "outcome": clip_line(outcome, OUTCOME_CAP), "area": area,
-    "result": result, "status": status, "flag": flag,
+    "result": result, "status": status, "flag": flag, "note": note,
     "ts": _coerce_iso(raw.get("ts")), "subs": public_subs,
   }
 
@@ -2898,12 +2946,28 @@ def _trace_turn(run: dict, agents: list[dict]) -> dict:
   tools = [tool for agent in agents for tool in agent.get("tools", [])]
   reports = [agent.get("report_full") or "" for agent in agents if agent.get("report_full")]
   original = reports[-1] if reports else ""
-  return {
+  turn = {
     "ts": run.get("started_at") or next((a.get("ts") for a in agents if a.get("ts")), None),
     "_agent_ids": [a["agent_id"] for a in agents],
     "_facts": _compact_turn_facts(tools, original), "_original": original,
     "_first_request": "",
   }
+  if (run.get("kind") == "workflow" and run.get("journal_counted_from_start")
+      and run.get("journal_caught_up")):
+    # Launched-versus-reported from the run journal only: it records every
+    # helper the runtime launched and every result it consumed, independently
+    # of transcript survival or display retention. The two integrity guards
+    # (counted from byte 0, read through EOF) make a claimed gap trustworthy;
+    # without them — a cursor that pre-dates the counters, or a partial read —
+    # we say nothing rather than risk calling complete work partial.
+    journal_started = int(run.get("journal_started") or 0)
+    launched = max(journal_started, len(agents))
+    reported = min(int(run.get("journal_resulted") or 0), launched)
+    silent = max(0, launched - reported) if journal_started else 0
+    if silent and not any(a.get("state") == "running" for a in agents):
+      turn["_silent_helpers"] = silent
+      turn["_launched_helpers"] = launched
+  return turn
 
 
 def _title_is_raw(title: str) -> bool:
@@ -3381,10 +3445,13 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
   # interleaving instead of appending a second, visually misleading sequence.
   for index, turn in enumerate(turns):
     when = turn.get("ts")
-    public_events.append(_timeline_event(
+    event = _timeline_event(
       f"main:{chat_id}:checkpoint:{index}", "main_checkpoint", "main", "main",
       turn.get("status"), when, when, "exact" if when else "unknown",
-      turn.get("outcome") or "", source_order=index))
+      turn.get("outcome") or "", source_order=index)
+    if turn.get("note"):
+      event["note"] = turn["note"]
+    public_events.append(event)
   main_runs = [dict(run, start_time_quality="exact" if run.get("started_at") else "unknown",
                     end_time_quality="exact" if run.get("ended_at") else "unknown")
                for run in platform_runs[-MAX_MAIN_RUNS_PER_CHAT:]]
@@ -4285,6 +4352,9 @@ def _build_fixture(root: Path) -> tuple[Path, Path]:
   ]) + "\n")
   _write(wdir / "journal.jsonl",
          json.dumps({"type": "started", "agentId": "wfB", "key": "v2:k"}) + "\n" +
+         # A helper the runtime launched whose result never landed (turn died
+         # mid-fleet). It leaves no transcript; only the journal knows it ran.
+         json.dumps({"type": "started", "agentId": "wfLost", "key": "v2:l"}) + "\n" +
          json.dumps({"type": "result", "agentId": "wfB", "key": "v2:k",
                      "result": {"verdict": "clean", "summary": "Merge is coherent; no leftover markers."}}) + "\n")
   # a task board card labelling the tasks run.
@@ -4400,13 +4470,24 @@ def selftest() -> int:
     _assert(doc_a["prompt_full"] == fixture_request, "root prompt is published")
     _assert(doc_a["turns"], "chat has derived turns")
     for turn in doc_a["turns"]:
-      _assert(set(turn) == {"outcome", "area", "result", "status", "flag", "ts",
-                            "subs"},
+      _assert(set(turn) == {"outcome", "area", "result", "status", "flag",
+                            "note", "ts", "subs"},
               f"turn keys: {set(turn)}")
       for sub in turn["subs"]:
         _assert(set(sub) == {"agent_id", "kind", "name", "ask", "state",
                              "depth", "prompt_available"},
                 f"sub keys: {set(sub)}")
+    # The fleet journal launched wfB + wfLost but only wfB reported: the turn
+    # carries an honest display-only completeness note, and stays un-flagged.
+    wf_turn = next((turn for turn in doc_a["turns"]
+                    if any(sub["agent_id"] == "wfB" for sub in turn["subs"])), None)
+    _assert(wf_turn is not None, "workflow fleet turn present")
+    _assert(wf_turn["note"] == "1 of 2 helpers never reported a result, "
+            "so this outcome may reflect partial work.",
+            f"lost-helper note derived from journal counts: {wf_turn.get('note')}")
+    _assert(all(turn["note"] is None for turn in doc_a["turns"]
+                if turn is not wf_turn),
+            "fully-reported turns carry no completeness note")
 
     doc_c = chats["chatC"]
     _assert(doc_c["provider"] == "codex", "chatC provider")

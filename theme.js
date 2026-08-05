@@ -495,6 +495,11 @@ export const CSS = `
   display: -webkit-box; overflow: hidden; color: var(--muted); font-size: 9.5px;
   line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 1;
 }
+.wf-time-main-note {
+  display: -webkit-box; overflow: hidden; font-size: 9.5px; line-height: 1.3;
+  -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  color: color-mix(in srgb, var(--wf-attn) 45%, var(--muted));
+}
 .wf-time-launch {
   position: relative; width: 108px; min-height: 68px; display: flex; align-items: flex-start;
   margin: 0; padding: 5px 7px 6px; appearance: none; text-align: left; font: inherit;
