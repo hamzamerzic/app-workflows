@@ -123,6 +123,7 @@ function normalizeEvent(raw, index) {
     state: raw.state === 'attention' ? 'attention' : mappedState,
     summary: raw.summary || raw.outcome || '',
     flag: raw.flag || '',
+    note: raw.note || '',
     _source_index: index,
   }
 }
@@ -152,6 +153,7 @@ function v3Timeline(turns, mainAgentId) {
       state: turn && turn.status,
       summary: (turn && turn.outcome) || 'Continued the task',
       flag: (turn && turn.flag) || '',
+      note: (turn && turn.note) || '',
     }, events.length))
     for (const [subIndex, sub] of (Array.isArray(turn && turn.subs) ? turn.subs : []).entries()) {
       const id = String(sub.agent_id || `v3-${turnIndex}-${subIndex}`)

@@ -286,6 +286,7 @@ function EventCard({ row, agent, parentAgent, mainAgentId, span, cohort, selecte
         )}
         <span className="wf-time-main-copy">{row.summary || 'Continued the task'}</span>
         {row.flag && <span className="wf-time-main-flag">{row.flag}</span>}
+        {row.note && <span className="wf-time-main-note">{row.note}</span>}
       </div>
     )
   } else if (row.type === 'agent_spawned' || (row.type === 'agent_started' && span && span.startEvent === row)) {
