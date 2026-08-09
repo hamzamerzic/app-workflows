@@ -19,26 +19,6 @@ import { isStale, relativeTime } from './domain.js'
 import { Home } from './views/Home.jsx'
 import { ChatDetail } from './views/ChatDetail.jsx'
 
-// Await a nav-open handle across runtime versions: the newer `outcome` API
-// carries a status ('owned'/'standalone' both mean render the view); the older
-// `ready` promise resolves true only for 'owned'. Missing nav → treat as
-// success and rely on the in-app back control.
-async function awaitNav(handle) {
-  try {
-    if (handle && handle.outcome && typeof handle.outcome.then === 'function') {
-      const res = await handle.outcome
-      const status = res && res.status
-      return status === 'owned' || status === 'standalone'
-    }
-    if (handle && handle.ready && typeof handle.ready.then === 'function') {
-      return await handle.ready.catch(() => false)
-    }
-  } catch (_) {
-    return false
-  }
-  return true
-}
-
 export default function App({ appId, token }) {
   const storage = useMemo(() => makeStorage(appId, token), [appId, token])
   const online = useOnline()
@@ -141,14 +121,24 @@ export default function App({ appId, token }) {
   const openDetail = useCallback(async (chatObj) => {
     const chatId = chatObj.chat_id
     if (window.mobius && window.mobius.nav && typeof window.mobius.nav.open === 'function') {
-      const handle = window.mobius.nav.open('workflows-chat', () => {
-        chatNavRef.current = null
-        setChat(null)
+      const detail = { chatId, meta: chatObj }
+      const handle = window.mobius.nav.open('workflows-chat', {
+        onBack: () => {
+          chatNavRef.current = null
+          setChat(null)
+        },
+        onForward: () => {
+          chatNavRef.current = handle
+          setChat(detail)
+        },
       })
       chatNavRef.current = handle
-      const okNav = await awaitNav(handle)
+      const outcome = await handle.outcome
       if (chatNavRef.current !== handle) return
-      if (!okNav) { chatNavRef.current = null; return }
+      if (outcome.status !== 'owned' && outcome.status !== 'standalone') {
+        chatNavRef.current = null
+        return
+      }
     }
     setChat({ chatId, meta: chatObj })
     if (window.mobius && typeof window.mobius.signal === 'function') {
