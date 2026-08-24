@@ -80,7 +80,7 @@ export const CSS = `
   flex: 0 0 auto; display: flex; align-items: center; gap: 11px;
   min-height: 52px;
   padding: max(11px, env(safe-area-inset-top)) 16px 11px;
-  background: var(--surface); border-bottom: 1px solid var(--border);
+  background: var(--bg); border-bottom: 1px solid var(--border);
 }
 .wf-brand { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 1 1 auto; }
 .wf-mark {
@@ -716,4 +716,22 @@ export const CSS = `
 }
 .wf-md-pre code { white-space: pre; }
 
+
+/* mobius-ui:CenteredRail v1 */
+@media (min-width: 900px) {
+  .wf-root {
+    background: radial-gradient(ellipse 62% 88% at 50% 48%,
+      color-mix(in srgb, var(--accent) 9%, var(--surface)) 0%,
+      color-mix(in srgb, var(--accent) 3%, var(--surface)) 38%,
+      var(--surface) 100%);
+  }
+  .wf-root::before {
+    content: ""; position: absolute; inset-block: 0; left: 50%;
+    width: min(100%, 700px); transform: translateX(-50%);
+    background: var(--bg); pointer-events: none;
+  }
+  .wf-header { width: min(100%, 700px); margin-inline: auto; }
+
+}
+/* /mobius-ui:CenteredRail */
 `
