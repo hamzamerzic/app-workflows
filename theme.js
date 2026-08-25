@@ -71,7 +71,7 @@ export const CSS = `
   word-break: break-word; overflow-wrap: anywhere;
 }
 .wf-scroll > * { flex-shrink: 0; }
-.wf-content { width: 100%; max-width: 700px; margin-inline: auto; padding-bottom: 18px; }
+.wf-content { width: 100%; max-width: 720px; margin-inline: auto; padding-bottom: 18px; }
 /* /mobius-ui:AppShell */
 
 /* mobius-ui:Header — app-owned; a future-library candidate (no sync owed).
@@ -81,6 +81,9 @@ export const CSS = `
   min-height: 52px;
   padding: max(11px, env(safe-area-inset-top)) 16px 11px;
   background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.wf-header-inner {
+  width: 100%; display: flex; align-items: center; gap: 11px;
 }
 .wf-brand { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 1 1 auto; }
 .wf-mark {
@@ -716,20 +719,10 @@ export const CSS = `
 }
 .wf-md-pre code { white-space: pre; }
 
-
-/* mobius-ui:CenteredRail v1 */
+/* Centered application rail on one continuous Möbius canvas. The Home wrapper is also
+   the responsive ownership seam that keeps Refresh pinned in the header row. */
 @media (min-width: 900px) {
-  .wf-root {
-    background:
-      linear-gradient(var(--bg), var(--bg)) center / min(100%, 700px) 100% no-repeat,
-      radial-gradient(ellipse 76% 112% at 50% 46%,
-        color-mix(in srgb, var(--accent) 18%, var(--bg)) 0%,
-        color-mix(in srgb, var(--accent) 7%, var(--bg)) 46%,
-        color-mix(in srgb, var(--text) 2%, var(--bg)) 100%);
-
-  }
-  .wf-header { width: min(100%, 700px); margin-inline: auto; }
-
+  .wf-header { width: min(100%, 760px); margin-inline: auto; }
 }
-/* /mobius-ui:CenteredRail */
+
 `
