@@ -71,7 +71,7 @@ export const CSS = `
   word-break: break-word; overflow-wrap: anywhere;
 }
 .wf-scroll > * { flex-shrink: 0; }
-.wf-content { width: 100%; max-width: 700px; margin-inline: auto; padding-bottom: 18px; }
+.wf-content { width: 100%; max-width: 720px; margin-inline: auto; padding-bottom: 18px; }
 /* /mobius-ui:AppShell */
 
 /* mobius-ui:Header — app-owned; a future-library candidate (no sync owed).
@@ -80,7 +80,10 @@ export const CSS = `
   flex: 0 0 auto; display: flex; align-items: center; gap: 11px;
   min-height: 52px;
   padding: max(11px, env(safe-area-inset-top)) 16px 11px;
-  background: var(--surface); border-bottom: 1px solid var(--border);
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.wf-header-inner {
+  width: 100%; display: flex; align-items: center; gap: 11px;
 }
 .wf-brand { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 1 1 auto; }
 .wf-mark {
@@ -715,5 +718,11 @@ export const CSS = `
   font-family: var(--mono, monospace); font-size: 11.5px; line-height: 1.45;
 }
 .wf-md-pre code { white-space: pre; }
+
+/* Centered application rail on one continuous Möbius canvas. The Home wrapper is also
+   the responsive ownership seam that keeps Refresh pinned in the header row. */
+@media (min-width: 900px) {
+  .wf-header { width: min(100%, 760px); margin-inline: auto; }
+}
 
 `
